@@ -3,8 +3,10 @@
 //! and reporting focus to the authoritative inbox as well as the wire.
 
 use super::HerdrWindow;
-use crate::{WINDOW_TITLE, sidebar};
-use gpui::Window;
+use crate::{WINDOW_TITLE, sidebar, state::LiveState};
+use gpui::{Context, Window};
+use herdr_client::Method;
+use serde_json::json;
 use std::time::{Duration, Instant};
 
 /// A drag or the full screen animation passes through many sizes, and each
@@ -12,13 +14,25 @@ use std::time::{Duration, Instant};
 /// transcripts. Only the size the window settles on is sent.
 pub(crate) const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 
+/// A frame another client took is re-claimed more slowly than a settled
+/// window resize, so the request is not resent while the daemon answers it.
+pub(crate) const RESIZE_REASSERT: Duration = Duration::from_secs(1);
+
+const BELL_PREVIEW_DELAY: Duration = Duration::from_secs(3);
+
 impl HerdrWindow {
     pub(crate) fn resize(&mut self) {
         self.resize_at(Instant::now());
     }
 
     pub(crate) fn resize_at(&mut self, now: Instant) {
-        if self.last_queued_options == Some(self.options) {
+        // Another client (a CLI, or another window) can resize the tab the
+        // window shows. The window's own options still hold, so the early
+        // return below would leave a frame that no longer matches them: ask
+        // for the size again whenever the daemon's frame disagrees.
+        let stale = self.live.surface.is_some() && !self.surface_matches_options();
+        let changed = self.last_queued_options != Some(self.options);
+        if self.last_queued_options == Some(self.options) && !stale {
             self.pending_resize = None;
             return;
         }
@@ -26,7 +40,12 @@ impl HerdrWindow {
         if self.last_queued_options.is_some() {
             match self.pending_resize {
                 Some((options, since)) if options == self.options => {
-                    if now.duration_since(since) < RESIZE_SETTLE {
+                    let wait = if changed {
+                        RESIZE_SETTLE
+                    } else {
+                        RESIZE_REASSERT
+                    };
+                    if now.duration_since(since) < wait {
                         return;
                     }
                 }
@@ -41,35 +60,64 @@ impl HerdrWindow {
             &self.live.snapshot,
         ) {
             match handle.resize(&snapshot.boot_id, self.options) {
-                Ok(()) => self.last_queued_options = Some(self.options),
+                Ok(()) => {
+                    self.last_queued_options = Some(self.options);
+                    // The daemon sizes a tab for the client that last
+                    // focused, selected or interacted with it. A resize
+                    // alone does not claim it back from another client (a
+                    // CLI, another window, or a TUI attached to the same
+                    // tab), so claim it: select the tab again and re-report
+                    // the window's focus.
+                    self.sent_focus = None;
+                    if let Some(tab) = snapshot.focused_tab_id.clone() {
+                        let _ = handle.request(
+                            &snapshot.boot_id,
+                            Method::TabFocus,
+                            json!({ "tab_id": tab }),
+                        );
+                    }
+                }
                 Err(error) => self.local_error = Some(format!("Resize: {error}")),
             }
         }
     }
 
-    /// macOS lists every window in the Window menu by title. Windows onto the
-    /// same daemon are told apart by the space each one is showing.
+    /// Rings the bell the selected connection forwarded, as `[bell]` asks.
+    pub(crate) fn ring_bell(&mut self, window: &mut Window) {
+        let Some(ring) =
+            self.bell
+                .take(self.config.bell, window.is_window_active(), Instant::now())
+        else {
+            return;
+        };
+        ring_bell(window, ring);
+    }
+
+    /// QA > Ring Bell: both reactions, whatever `[bell]` says, after a delay
+    /// long enough to switch to another app, since attention is only asked
+    /// for while the window is inactive.
+    pub(crate) fn preview_bell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(BELL_PREVIEW_DELAY).await;
+            let _ = this.update_in(cx, |_, window, _| {
+                ring_bell(
+                    window,
+                    crate::bell::Ring {
+                        attention: !window.is_window_active(),
+                        sound: true,
+                    },
+                );
+            });
+        })
+        .detach();
+    }
+
+    /// The daemon's title for the selected connection wins: an agent's
+    /// `client.window_title.set` or Herdr's rendered `ui.window_title`.
+    /// Otherwise macOS lists every window in the Window menu by title, and
+    /// windows onto the same daemon are told apart by the space each shows.
     pub(crate) fn sync_window_title(&mut self, window: &mut Window) {
-        let title = self
-            .live
-            .snapshot
-            .as_ref()
-            .and_then(|snapshot| {
-                let focused = snapshot.focused_workspace_id.as_deref()?;
-                snapshot
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.workspace_id == focused)
-            })
-            .map_or_else(
-                || WINDOW_TITLE.to_owned(),
-                |workspace| {
-                    format!(
-                        "{WINDOW_TITLE} \u{2014} {}",
-                        sidebar::workspace_label(workspace, false)
-                    )
-                },
-            );
+        let title = window_title(&self.live);
         if self.title != title {
             window.set_window_title(&title);
             self.title = title;
@@ -104,4 +152,37 @@ impl HerdrWindow {
             self.sent_focus = Some(focused);
         }
     }
+}
+
+fn ring_bell(window: &Window, ring: crate::bell::Ring) {
+    if ring.attention {
+        window.request_attention();
+    }
+    if ring.sound {
+        window.play_system_bell();
+    }
+}
+
+fn window_title(live: &LiveState) -> String {
+    if let Some(title) = &live.window_title {
+        return title.clone();
+    }
+    live.snapshot
+        .as_ref()
+        .and_then(|snapshot| {
+            let focused = snapshot.focused_workspace_id.as_deref()?;
+            snapshot
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == focused)
+        })
+        .map_or_else(
+            || WINDOW_TITLE.to_owned(),
+            |workspace| {
+                format!(
+                    "{WINDOW_TITLE} \u{2014} {}",
+                    sidebar::workspace_label(workspace, false)
+                )
+            },
+        )
 }

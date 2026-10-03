@@ -1,13 +1,17 @@
-use crate::{APP_VERSION, HerdrWindow, menu::Page, updater::State};
+use crate::{
+    APP_VERSION, HerdrWindow,
+    menu::Page,
+    progress::{self, Progress},
+    updater::State,
+};
 use gpui::{prelude::*, *};
-use std::time::Duration;
 
 fn update_progress(state: &State, accent: Hsla, track: Hsla) -> Option<Div> {
-    let fraction = match state {
+    let progress = match state {
         State::Downloading { received, total } if *total > 0 && received < total => {
-            Some(*received as f32 / *total as f32)
+            Progress::Fraction(*received as f32 / *total as f32)
         }
-        State::Ready { .. } | State::Restart { .. } => Some(1.),
+        State::Ready { .. } | State::Restart { .. } => Progress::Fraction(1.),
         // Homebrew has no reliable overall percentage. A completed archive still
         // needs extraction and verification before it is ready to install.
         State::Checking
@@ -15,41 +19,15 @@ fn update_progress(state: &State, accent: Hsla, track: Hsla) -> Option<Div> {
         | State::Installing
         | State::Upgrading { .. }
         | State::Restarting
-        | State::Cancelling => None,
+        | State::Cancelling => Progress::Busy,
         _ => return None,
     };
-    let fill = div()
-        .debug_selector(|| "app-update-progress-fill".into())
-        .h_full()
-        .rounded_full()
-        .bg(accent);
-    Some(
-        div()
-            .debug_selector(|| "app-update-progress".into())
-            .relative()
-            .flex_none()
-            .w_full()
-            .h(px(6.))
-            .rounded_full()
-            .overflow_hidden()
-            .bg(track)
-            .child(if let Some(fraction) = fraction {
-                fill.w(relative(fraction.clamp(0., 1.))).into_any_element()
-            } else {
-                fill.absolute()
-                    .w(relative(0.3))
-                    .with_animation(
-                        "app-update-busy",
-                        Animation::new(Duration::from_secs(2)).repeat(),
-                        |fill, delta| {
-                            fill.left(relative(
-                                0.35 * (1. - (delta * std::f32::consts::TAU).cos()),
-                            ))
-                        },
-                    )
-                    .into_any_element()
-            }),
-    )
+    Some(progress::bar(
+        "app-update-progress",
+        progress,
+        accent,
+        track,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -94,7 +72,7 @@ impl HerdrWindow {
     pub(super) fn render_app_update(&self, window: &Window, cx: &mut Context<Self>) -> Div {
         let font = &self.config.ui;
         let theme = &self.theme;
-        let accent = rgb(theme.foreground).blend(rgba((theme.palette[4] << 8) | 0x70));
+        let accent = crate::menu::accent(theme);
         let state = self.update_preview.as_ref().unwrap_or(self.updater.state());
         let (message, action) = match state {
             State::Disabled(reason) => (format!("In-app updates unavailable: {reason}"), None),

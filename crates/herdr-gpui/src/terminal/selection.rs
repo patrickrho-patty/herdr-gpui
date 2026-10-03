@@ -1,19 +1,26 @@
 //! Selecting painted cells with the pointer, and the text a release copies.
 //!
 //! Selection is client-local: the daemon owns the terminal, and nothing here
-//! sends input to it or asks it for content. Cells are addressed in the grid of
-//! the frame that paints them, so a pane selection never leaves its inner rect
-//! and a popup selection never reaches the panes underneath it.
+//! sends input to it. Columns are addressed in the grid of the frame that
+//! paints them, so a pane selection never leaves its inner rect and a popup
+//! selection never reaches the panes underneath it. Rows are content rows: a
+//! pane's absolute screen-buffer row (the one `pane.selection.read` takes),
+//! which stays with its text while the pane scrolls, and a popup's own grid
+//! row. A selection that reaches rows the pane no longer shows is read back
+//! from the daemon instead of from the painted cells.
 
 use super::{HIDDEN, InputTarget, popup_origin, wheel_target};
 use crate::error::{Error, Result};
-use herdr_client::protocol::PaneSurfaceFrame;
+use herdr_client::{
+    protocol::{CellData, FrameData, PaneSurfaceFrame},
+    scrollback::{TextPoint, TextRange},
+};
 use std::ops::Range;
 use unicode_width::UnicodeWidthStr;
 
 /// Terminal content is untrusted and one cell's symbol carries as many bytes as
 /// it likes, so a copy is bounded rather than trusted to be screen-sized.
-const MAX_SELECTION_BYTES: usize = 4 << 20;
+pub(crate) const MAX_SELECTION_BYTES: usize = 4 << 20;
 
 /// Which half of a cell the pointer sat in. Anchoring on the half, as terminal
 /// emulators do, is what makes a single cell selectable while a plain click,
@@ -28,20 +35,38 @@ enum Side {
 /// ends of a drag sort into a start and an end whichever way it was made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Edge {
-    row: u16,
+    /// A content row; see the module documentation.
+    row: u32,
     column: u16,
     side: Side,
 }
 
 /// The cells one target owns, in its own frame's grid, and where that grid is
-/// painted relative to the canvas origin.
+/// painted relative to the canvas origin. `top` is the content row painted on
+/// the grid's first row.
 struct Region {
     columns: Range<u16>,
     rows: Range<u16>,
     origin: (f32, f32),
+    top: u32,
 }
 
 impl Region {
+    fn content_row(&self, row: u16) -> u32 {
+        self.top.saturating_add(u32::from(row - self.rows.start))
+    }
+
+    /// The grid row a content row paints on, when it is on screen.
+    fn grid_row(&self, row: u32) -> Option<u16> {
+        let offset = u16::try_from(row.checked_sub(self.top)?).ok()?;
+        let row = self.rows.start.checked_add(offset)?;
+        self.rows.contains(&row).then_some(row)
+    }
+
+    fn shows(&self, row: u32) -> bool {
+        self.grid_row(row).is_some()
+    }
+
     /// The cell edge under a pointer, clamped into the region so that dragging
     /// out of it selects up to its boundary instead of ending the gesture.
     fn edge(&self, x: f32, y: f32, cell_width: f32, cell_height: f32) -> Option<Edge> {
@@ -60,19 +85,19 @@ impl Region {
         let row = ((y - self.origin.1) / cell_height).floor();
         if row < f32::from(self.rows.start) {
             return Some(Edge {
-                row: self.rows.start,
+                row: self.top,
                 column: self.columns.start,
                 side: Side::Left,
             });
         }
         if row > f32::from(last_row) {
             return Some(Edge {
-                row: last_row,
+                row: self.content_row(last_row),
                 column: last_column,
                 side: Side::Right,
             });
         }
-        let row = row as u16;
+        let row = self.content_row(row as u16);
         let column = (x - self.origin.0) / cell_width;
         if column < f32::from(self.columns.start) {
             return Some(Edge {
@@ -118,23 +143,176 @@ fn region(
                 columns: 0..popup.frame.width,
                 rows: 0..popup.frame.height,
                 origin: (f32::from(origin.x), f32::from(origin.y)),
+                top: 0,
             })
         }
         // A popup covers the panes: what was selected under it is off screen.
         InputTarget::Pane(_) if surface.popup.is_some() => None,
         InputTarget::Pane(pane_id) => {
-            let rect = surface
-                .panes
-                .iter()
-                .find(|pane| pane.pane_id == *pane_id)?
-                .inner_rect;
+            let pane = surface.panes.iter().find(|pane| pane.pane_id == *pane_id)?;
+            let rect = pane.inner_rect;
             Some(Region {
                 columns: rect.x..rect.x.saturating_add(rect.width),
                 rows: rect.y..rect.y.saturating_add(rect.height),
                 origin: (0., 0.),
+                top: crate::scrollback::viewport_top(pane),
             })
         }
     }
+}
+
+/// The frame whose grid a target's cells are addressed in.
+fn frame<'a>(surface: &'a PaneSurfaceFrame, target: &InputTarget) -> Option<&'a FrameData> {
+    match target {
+        InputTarget::Popup(_) => surface.popup.as_ref().map(|popup| &popup.frame),
+        InputTarget::Pane(_) => Some(&surface.frame),
+    }
+}
+
+/// How much one press takes: the half-cell under it for a single click, the
+/// link or word for a double click, and the whole row for a triple click. A
+/// drag that follows grows the selection by the same unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unit {
+    Cell,
+    Word,
+    Line,
+}
+
+impl From<usize> for Unit {
+    fn from(clicks: usize) -> Self {
+        match clicks {
+            0 | 1 => Self::Cell,
+            2 => Self::Word,
+            _ => Self::Line,
+        }
+    }
+}
+
+impl Unit {
+    /// The first and last edge of the unit around `edge`.
+    fn span(self, frame: &FrameData, region: &Region, edge: Edge) -> (Edge, Edge) {
+        let row = |columns: Range<u16>| {
+            (
+                Edge {
+                    row: edge.row,
+                    column: columns.start,
+                    side: Side::Left,
+                },
+                Edge {
+                    row: edge.row,
+                    column: columns.end - 1,
+                    side: Side::Right,
+                },
+            )
+        };
+        match self {
+            Self::Cell => (edge, edge),
+            Self::Line => row(region.columns.clone()),
+            Self::Word => row(region
+                .grid_row(edge.row)
+                .and_then(|grid| word(frame, region, grid, edge.column))
+                .unwrap_or(edge.column..edge.column + 1)),
+        }
+    }
+}
+
+/// The columns of the unbroken run of cells around `hit` that belong, where
+/// cells are indexed from the region's first column.
+fn run(start: u16, hit: usize, len: usize, belongs: &impl Fn(usize) -> bool) -> Range<u16> {
+    let first = (0..hit)
+        .rev()
+        .take_while(|&i| belongs(i))
+        .last()
+        .unwrap_or(hit);
+    let last = (hit + 1..len)
+        .take_while(|&i| belongs(i))
+        .last()
+        .unwrap_or(hit);
+    let at = |index: usize| start + index as u16;
+    at(first)..at(last) + 1
+}
+
+/// Characters that end a word even though they are printed: quotes, brackets,
+/// and the separators and borders that sit between words in terminal output.
+fn separates(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_control()
+        || matches!(
+            c,
+            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '|' | ',' | ';'
+        )
+        || ('\u{2500}'..='\u{259f}').contains(&c)
+}
+
+/// The columns of the word a double click at `column` chooses. An explicit
+/// hyperlink takes its whole run of cells and a plain web URL its whole
+/// destination; otherwise the word runs to the nearest separator, so paths
+/// such as `src/main.rs:12` come out whole, without the punctuation that ends
+/// a sentence after them. `None` when the click is not on a word.
+fn word(frame: &FrameData, region: &Region, row: u16, column: u16) -> Option<Range<u16>> {
+    let Region { columns, .. } = region;
+    if row >= frame.height || columns.end > frame.width || !columns.contains(&column) {
+        return None;
+    }
+    let offset = usize::from(row) * usize::from(frame.width);
+    let cells = frame
+        .cells
+        .get(offset + usize::from(columns.start)..offset + usize::from(columns.end))?;
+    // A wide character's continuation cells belong to the cell that drew it.
+    let source = |index: usize| (0..=index).rev().find(|&i| !cells[i].skip).unwrap_or(index);
+    fn symbol(cell: &CellData) -> &str {
+        if cell.modifier & HIDDEN != 0 || cell.symbol.is_empty() {
+            " "
+        } else {
+            cell.symbol.as_str()
+        }
+    }
+    let hit = source(usize::from(column - columns.start));
+    if let Some(link) = cells[hit].hyperlink {
+        return Some(run(columns.start, hit, cells.len(), &|i| {
+            cells[i].skip || cells[i].hyperlink == Some(link)
+        }));
+    }
+
+    // Byte offsets into the row's text, so a plain URL maps back to columns.
+    let mut text = String::new();
+    let mut starts = Vec::with_capacity(cells.len());
+    for cell in cells {
+        starts.push(text.len());
+        if cell.skip {
+            continue;
+        }
+        let symbol = symbol(cell);
+        if text.len() + symbol.len() > super::links::MAX_ROW_BYTES {
+            return None;
+        }
+        text.push_str(symbol);
+    }
+    if let Some((range, _)) = super::links::plain_url(&text, starts[hit]) {
+        return Some(run(columns.start, hit, cells.len(), &|i| {
+            range.contains(&starts[source(i)])
+        }));
+    }
+
+    let first_char = |index: usize| symbol(&cells[source(index)]).chars().next().unwrap_or(' ');
+    if separates(first_char(hit)) {
+        return None;
+    }
+    let mut span = run(columns.start, hit, cells.len(), &|i| {
+        !separates(first_char(i))
+    });
+    // Punctuation closing a sentence is not part of the word before it, unless
+    // it is what was clicked.
+    while span.end - 1 > column
+        && matches!(
+            first_char(usize::from(span.end - 1 - columns.start)),
+            '.' | ':' | '!' | '?'
+        )
+    {
+        span.end -= 1;
+    }
+    Some(span)
 }
 
 /// Cells the pointer has chosen in one pane or popup. The region is resolved
@@ -143,6 +321,9 @@ fn region(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Selection {
     target: InputTarget,
+    unit: Unit,
+    /// The unit the press chose, which the selection always keeps.
+    origin: (Edge, Edge),
     anchor: Edge,
     head: Edge,
     dragging: bool,
@@ -150,24 +331,27 @@ pub(crate) struct Selection {
 
 impl Selection {
     /// Starts a drag at the pointer, or `None` where no pane or popup paints.
+    /// `clicks` is the press's click count: a double click starts on the word
+    /// under the pointer and a triple click on its row.
     pub(crate) fn begin(
         surface: &PaneSurfaceFrame,
         x: f32,
         y: f32,
         cell_width: f32,
         cell_height: f32,
+        clicks: usize,
     ) -> Option<Self> {
         let target = wheel_target(surface, x, y, cell_width, cell_height)?.target;
-        let edge = region(surface, &target, cell_width, cell_height)?.edge(
-            x,
-            y,
-            cell_width,
-            cell_height,
-        )?;
+        let region = region(surface, &target, cell_width, cell_height)?;
+        let edge = region.edge(x, y, cell_width, cell_height)?;
+        let unit = Unit::from(clicks);
+        let origin = unit.span(frame(surface, &target)?, &region, edge);
         Some(Self {
             target,
-            anchor: edge,
-            head: edge,
+            unit,
+            origin,
+            anchor: origin.0,
+            head: origin.1,
             dragging: true,
         })
     }
@@ -185,17 +369,39 @@ impl Selection {
         cell_width: f32,
         cell_height: f32,
     ) -> bool {
-        let Some(edge) = region(surface, &self.target, cell_width, cell_height)
-            .and_then(|region| region.edge(x, y, cell_width, cell_height))
-        else {
+        let Some(region) = region(surface, &self.target, cell_width, cell_height) else {
             return false;
         };
-        std::mem::replace(&mut self.head, edge) != edge
+        let (Some(edge), Some(frame)) = (
+            region.edge(x, y, cell_width, cell_height),
+            frame(surface, &self.target),
+        ) else {
+            return false;
+        };
+        let (start, end) = self.unit.span(frame, &region, edge);
+        // Dragging back before the unit the press chose keeps its far end, so
+        // the selection never loses what the press took.
+        let ends = if start < self.origin.0 {
+            (self.origin.1, start)
+        } else {
+            (self.origin.0, end.max(self.origin.1))
+        };
+        let changed = (self.anchor, self.head) != ends;
+        (self.anchor, self.head) = ends;
+        changed
     }
 
     /// Ends the drag. `false` when the gesture had already finished.
     pub(crate) fn release(&mut self) -> bool {
         std::mem::replace(&mut self.dragging, false)
+    }
+
+    /// The pane a pane selection belongs to.
+    pub(crate) fn pane_id(&self) -> Option<&str> {
+        match &self.target {
+            InputTarget::Pane(id) => Some(id),
+            InputTarget::Popup(_) => None,
+        }
     }
 
     /// True for a selection that paints on the composite frame of the panes.
@@ -221,15 +427,21 @@ impl Selection {
             .flat_map(|region| self.spans(region))
     }
 
-    fn spans(&self, region: Region) -> impl Iterator<Item = (u16, Range<u16>)> {
-        let (start, end) = if self.anchor <= self.head {
+    fn ends(&self) -> (Edge, Edge) {
+        if self.anchor <= self.head {
             (self.anchor, self.head)
         } else {
             (self.head, self.anchor)
-        };
-        let Region { columns, rows, .. } = region;
-        let last = end.row.min(rows.end.saturating_sub(1));
-        let mut next = Some(start.row.max(rows.start));
+        }
+    }
+
+    /// The selected cells of each content row the region shows, in its grid.
+    fn spans(&self, region: Region) -> impl Iterator<Item = (u16, Range<u16>)> {
+        let (start, end) = self.ends();
+        let columns = region.columns.clone();
+        let bottom = region.content_row(region.rows.end.saturating_sub(1));
+        let last = end.row.min(bottom);
+        let mut next = Some(start.row.max(region.top)).filter(|_| !region.rows.is_empty());
         std::iter::from_fn(move || {
             while let Some(row) = next.filter(|row| *row <= last) {
                 next = row.checked_add(1);
@@ -249,12 +461,80 @@ impl Selection {
                 } else {
                     columns.end
                 };
-                if first < stop {
-                    return Some((row, first..stop));
+                if first < stop
+                    && let Some(grid) = region.grid_row(row)
+                {
+                    return Some((grid, first..stop));
                 }
             }
             None
         })
+    }
+
+    /// The pane and inclusive cell range to read from the daemon, for a pane
+    /// selection that reaches rows the pane does not show; `None` when the
+    /// painted cells hold all of it, or when it chose no cell.
+    pub(crate) fn offscreen_range(
+        &self,
+        surface: &PaneSurfaceFrame,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> Option<(&str, TextRange)> {
+        let InputTarget::Pane(pane_id) = &self.target else {
+            return None;
+        };
+        let region = region(surface, &self.target, cell_width, cell_height)?;
+        let (start, end) = self.ends();
+        if region.shows(start.row) && region.shows(end.row) {
+            return None;
+        }
+        let Region { columns, .. } = region;
+        let last = columns.end.checked_sub(1)?;
+        // Edges sit between cells: a right edge takes its cell's successor at
+        // the start, a left edge its predecessor at the end.
+        let first = match start.side {
+            Side::Left => TextPoint {
+                row: start.row,
+                col: start.column,
+            },
+            Side::Right if start.column < last => TextPoint {
+                row: start.row,
+                col: start.column + 1,
+            },
+            Side::Right => TextPoint {
+                row: start.row.checked_add(1)?,
+                col: columns.start,
+            },
+        };
+        let stop = match end.side {
+            Side::Right => TextPoint {
+                row: end.row,
+                col: end.column,
+            },
+            Side::Left if end.column > columns.start => TextPoint {
+                row: end.row,
+                col: end.column - 1,
+            },
+            Side::Left => TextPoint {
+                row: end.row.checked_sub(1)?,
+                col: last,
+            },
+        };
+        if stop < first {
+            return None;
+        }
+        // The daemon counts columns from the pane's own left edge.
+        let local = |point: TextPoint| TextPoint {
+            col: point.col - columns.start,
+            ..point
+        };
+        Some((
+            pane_id,
+            TextRange {
+                start: local(first),
+                end: local(stop),
+            },
+        ))
     }
 
     /// The selected text, with rows separated by a newline. Padding is trimmed
@@ -268,10 +548,11 @@ impl Selection {
     ) -> Result<String> {
         let region =
             region(surface, &self.target, cell_width, cell_height).ok_or(Error::SelectionStale)?;
-        let frame = match &self.target {
-            InputTarget::Popup(_) => &surface.popup.as_ref().ok_or(Error::SelectionStale)?.frame,
-            InputTarget::Pane(_) => &surface.frame,
-        };
+        let frame = frame(surface, &self.target).ok_or(Error::SelectionStale)?;
+        let (start, end) = self.ends();
+        if !region.shows(start.row) || !region.shows(end.row) {
+            return Err(Error::SelectionOffscreen);
+        }
         let edge = region.columns.end;
         let left = region.columns.start;
         let mut text = String::new();
@@ -395,7 +676,7 @@ mod tests {
 
     fn drag(surface: &PaneSurfaceFrame, from: (f32, f32), to: (f32, f32)) -> Selection {
         let mut selection =
-            Selection::begin(surface, from.0, from.1, CELL_WIDTH, CELL_HEIGHT).unwrap();
+            Selection::begin(surface, from.0, from.1, CELL_WIDTH, CELL_HEIGHT, 1).unwrap();
         selection.extend(surface, to.0, to.1, CELL_WIDTH, CELL_HEIGHT);
         selection
     }
@@ -528,7 +809,7 @@ mod tests {
             pixel_height: 40,
         }));
         // The popup is centered: three columns and half a row of offset.
-        assert!(Selection::begin(&s, 1., 1., CELL_WIDTH, CELL_HEIGHT).is_none());
+        assert!(Selection::begin(&s, 1., 1., CELL_WIDTH, CELL_HEIGHT, 1).is_none());
         let selection = drag(&s, (31., 11.), (66., 31.));
         assert!(selection.in_popup("popup") && !selection.in_panes());
         assert!(!selection.in_popup("other"));
@@ -622,14 +903,14 @@ mod tests {
     fn invalid_geometry_and_a_dragged_release_are_rejected() {
         let s = surface("abcdefghij");
         for invalid in [0., -1., f32::NAN, f32::INFINITY] {
-            assert!(Selection::begin(&s, 1., 1., invalid, CELL_HEIGHT).is_none());
-            assert!(Selection::begin(&s, 1., 1., CELL_WIDTH, invalid).is_none());
+            assert!(Selection::begin(&s, 1., 1., invalid, CELL_HEIGHT, 1).is_none());
+            assert!(Selection::begin(&s, 1., 1., CELL_WIDTH, invalid, 1).is_none());
         }
         for outside in [-1., f32::NAN, f32::INFINITY] {
-            assert!(Selection::begin(&s, outside, 1., CELL_WIDTH, CELL_HEIGHT).is_none());
-            assert!(Selection::begin(&s, 1., outside, CELL_WIDTH, CELL_HEIGHT).is_none());
+            assert!(Selection::begin(&s, outside, 1., CELL_WIDTH, CELL_HEIGHT, 1).is_none());
+            assert!(Selection::begin(&s, 1., outside, CELL_WIDTH, CELL_HEIGHT, 1).is_none());
         }
-        let mut selection = Selection::begin(&s, 1., 1., CELL_WIDTH, CELL_HEIGHT).unwrap();
+        let mut selection = Selection::begin(&s, 1., 1., CELL_WIDTH, CELL_HEIGHT, 1).unwrap();
         for invalid in [f32::NAN, f32::INFINITY] {
             assert!(!selection.extend(&s, invalid, 1., CELL_WIDTH, CELL_HEIGHT));
             assert!(!selection.extend(&s, 1., invalid, CELL_WIDTH, CELL_HEIGHT));
@@ -641,5 +922,172 @@ mod tests {
         // A finished selection still describes the same cells.
         assert!(selection.extend(&s, 46., 1., CELL_WIDTH, CELL_HEIGHT));
         assert_eq!(text(&s, &selection), "abcde");
+    }
+
+    /// One pane of a single row as wide as `text` plus some padding.
+    fn row(text: &str) -> PaneSurfaceFrame {
+        let width = text.chars().count() as u16 + 4;
+        let mut s = surface("");
+        s.frame = frame(text, width, 1);
+        s.panes[0].rect.width = width;
+        s.panes[0].rect.height = 1;
+        s.panes[0].inner_rect = s.panes[0].rect;
+        s
+    }
+
+    /// What a press of `clicks` at `column` of the one row chooses.
+    fn pick(s: &PaneSurfaceFrame, column: f32, clicks: usize) -> String {
+        let x = column * CELL_WIDTH + 1.;
+        text(
+            s,
+            &Selection::begin(s, x, 1., CELL_WIDTH, CELL_HEIGHT, clicks).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_double_click_takes_the_word_path_or_url_under_it() {
+        let s = row("ls src/main.rs:12. (see https://example.com/a_(b)). done");
+        assert_eq!(pick(&s, 0., 2), "ls");
+        assert_eq!(pick(&s, 5., 2), "src/main.rs:12");
+        // Punctuation that ends a sentence stays out unless it was clicked.
+        assert_eq!(pick(&s, 17., 2), "src/main.rs:12.");
+        assert_eq!(pick(&s, 20., 2), "see");
+        for column in [24., 35., 45.] {
+            assert_eq!(pick(&s, column, 2), "https://example.com/a_(b)");
+        }
+        // A separator or a blank is a word of its own cell.
+        assert_eq!(pick(&s, 19., 2), "(");
+        assert_eq!(pick(&s, 2., 2), " ");
+        // A single click still starts an empty drag.
+        assert_eq!(pick(&s, 5., 1), "");
+    }
+
+    #[test]
+    fn a_double_click_takes_a_whole_hyperlink_and_wide_characters() {
+        let mut s = row("go here now 界 界  x");
+        s.frame.hyperlinks = vec!["https://example.com".into()];
+        for column in 3..7 {
+            s.frame.cells[column].hyperlink = Some(0);
+        }
+        assert_eq!(pick(&s, 4., 2), "here");
+        s.frame.cells[13].skip = true;
+        s.frame.cells[15].skip = true;
+        assert_eq!(pick(&s, 13., 2), "界界");
+        // Hidden text is never a word.
+        s.frame.cells[17].modifier = HIDDEN;
+        assert_eq!(pick(&s, 17., 2), " ");
+    }
+
+    #[test]
+    fn a_triple_click_takes_the_row_and_drags_grow_by_the_unit() {
+        let s = surface("one two   three four");
+        let y = CELL_HEIGHT + 1.;
+        let line = Selection::begin(&s, 41., y, CELL_WIDTH, CELL_HEIGHT, 3).unwrap();
+        assert_eq!(text(&s, &line), "three four");
+
+        let mut words = Selection::begin(&s, 41., 1., CELL_WIDTH, CELL_HEIGHT, 2).unwrap();
+        assert_eq!(text(&s, &words), "two");
+        // Forward to the middle of the next row's first word takes all of it.
+        assert!(words.extend(&s, 11., y, CELL_WIDTH, CELL_HEIGHT));
+        assert_eq!(text(&s, &words), "two\nthree");
+        // Back before the press keeps the word the press chose.
+        assert!(words.extend(&s, 11., 1., CELL_WIDTH, CELL_HEIGHT));
+        assert_eq!(text(&s, &words), "one two");
+        assert!(!words.extend(&s, 1., 1., CELL_WIDTH, CELL_HEIGHT));
+
+        let mut lines = Selection::begin(&s, 1., 1., CELL_WIDTH, CELL_HEIGHT, 3).unwrap();
+        assert!(lines.extend(&s, 1., y, CELL_WIDTH, CELL_HEIGHT));
+        assert_eq!(text(&s, &lines), "one two\nthree four");
+    }
+
+    /// `surface` scrolled to show content rows `top..top + 3` of a pane with
+    /// ten rows of history.
+    fn scrolled(text: &str, top: u32) -> PaneSurfaceFrame {
+        let mut s = surface(text);
+        s.panes[0].scroll = Some(herdr_client::protocol::PaneSurfaceScrollMetrics {
+            offset_from_bottom: u64::from(10 - top),
+            max_offset_from_bottom: 10,
+            viewport_rows: 3,
+        });
+        s
+    }
+
+    #[test]
+    fn a_selection_keeps_its_text_rows_while_the_pane_scrolls() {
+        // Rows 10..13 show; the drag takes row 10 from column 1 to row 12
+        // through column 3.
+        let at_bottom = scrolled("abcdefghij", 10);
+        let selection = drag(&at_bottom, (11., 1.), (36., 41.));
+        assert_eq!(
+            selection
+                .rows(&at_bottom, CELL_WIDTH, CELL_HEIGHT)
+                .collect::<Vec<_>>(),
+            vec![(0, 1..10), (1, 0..10), (2, 0..4)]
+        );
+        assert!(
+            selection
+                .offscreen_range(&at_bottom, CELL_WIDTH, CELL_HEIGHT)
+                .is_none(),
+            "every row is painted, so the painted cells are copied"
+        );
+        // Scrolled up two rows, row 10 paints on the last grid row and the
+        // rest of the selection is below the screen.
+        let up = scrolled("abcdefghij", 8);
+        assert_eq!(
+            selection
+                .rows(&up, CELL_WIDTH, CELL_HEIGHT)
+                .collect::<Vec<_>>(),
+            vec![(2, 1..10)]
+        );
+        assert!(matches!(
+            selection.text(&up, CELL_WIDTH, CELL_HEIGHT),
+            Err(Error::SelectionOffscreen)
+        ));
+        let (pane, range) = selection
+            .offscreen_range(&up, CELL_WIDTH, CELL_HEIGHT)
+            .unwrap();
+        assert_eq!(pane, "pane");
+        assert_eq!(
+            range,
+            TextRange {
+                start: TextPoint { row: 10, col: 1 },
+                end: TextPoint { row: 12, col: 3 },
+            }
+        );
+    }
+
+    #[test]
+    fn a_selection_dragged_past_the_screen_follows_the_scroll() {
+        let at_bottom = scrolled("abcdefghij", 10);
+        let mut selection = drag(&at_bottom, (51., 41.), (51., 41.));
+        // The pointer above the pane reaches the first painted cell; as the
+        // pane scrolls up under it, the selection grows into the history.
+        let up = scrolled("abcdefghij", 5);
+        assert!(selection.extend(&up, 51., -40., CELL_WIDTH, CELL_HEIGHT));
+        let (_, range) = selection
+            .offscreen_range(&up, CELL_WIDTH, CELL_HEIGHT)
+            .unwrap();
+        assert_eq!(
+            range,
+            TextRange {
+                start: TextPoint { row: 5, col: 0 },
+                end: TextPoint { row: 12, col: 4 },
+            }
+        );
+        // An edge on the right of a row's last cell starts on the next row.
+        let mut tail = drag(&up, (96., 1.), (96., 1.));
+        assert!(tail.extend(&at_bottom, 1., 1e6, CELL_WIDTH, CELL_HEIGHT));
+        let (_, range) = tail
+            .offscreen_range(&at_bottom, CELL_WIDTH, CELL_HEIGHT)
+            .unwrap();
+        assert_eq!(range.start, TextPoint { row: 6, col: 0 });
+        assert_eq!(range.end, TextPoint { row: 12, col: 9 });
+        // A press that chose no cell has nothing to read, wherever it is.
+        assert!(
+            Selection::begin(&at_bottom, 1., 1., CELL_WIDTH, CELL_HEIGHT, 1)
+                .unwrap()
+                .offscreen_range(&up, CELL_WIDTH, CELL_HEIGHT)
+                .is_none()
+        );
     }
 }

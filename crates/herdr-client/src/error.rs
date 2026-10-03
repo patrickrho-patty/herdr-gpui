@@ -123,6 +123,10 @@ pub enum Error {
     SurfaceIdentity,
     #[error("patch before baseline")]
     PatchBeforeBaseline,
+    #[error("encoded surface before baseline")]
+    EncodedSurfaceBeforeBaseline,
+    #[error("surface encoding was not advertised by endpoint")]
+    SurfaceEncodingNotNegotiated,
     #[error("response boot mismatch")]
     ResponseBoot,
     #[error("response limit exceeded")]
@@ -179,6 +183,30 @@ pub enum Error {
         source: Box<Error>,
         cleanup: Box<Error>,
     },
+    #[error("host scripts require a Linux or macOS client")]
+    ScriptUnsupported,
+    #[error("could not start host script")]
+    ScriptSpawn(#[source] io::Error),
+    #[error("host script I/O failed")]
+    ScriptIo(#[source] io::Error),
+    #[error("could not read host script input")]
+    ScriptInput(#[source] io::Error),
+    #[error("could not write host script output")]
+    ScriptOutput(#[source] io::Error),
+    #[error("host script output exceeds limit")]
+    ScriptOutputLimit,
+    #[error("host script cancelled")]
+    ScriptCancelled,
+    #[error("host script made no progress before its deadline")]
+    ScriptTimeout,
+    #[error("host script worker panicked")]
+    ScriptWorker,
+    /// `stderr` is a bounded, control-free tail kept for diagnostics.
+    #[error("host script failed ({status}): {stderr}")]
+    ScriptExit {
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
     #[error("endpoint selection is not a regular file")]
     SelectionNotFile,
     #[error("endpoint selection exceeds storage limit")]
@@ -203,6 +231,19 @@ pub enum Error {
     ProfileLabel,
     #[error("too many sessions to list")]
     SessionLimit,
+    /// An endpoint answered a request with an error. The message is the
+    /// daemon's own display text; act on `code`, never on the message.
+    #[error("{message}")]
+    Endpoint {
+        code: crate::scrollback::EndpointErrorCode,
+        message: String,
+    },
+    #[error("invalid endpoint response")]
+    ResponseSchema(#[source] serde_json::Error),
+    #[error("endpoint response carried neither a result nor an error")]
+    ResponseMissingResult,
+    #[error("endpoint answered with a result of another method")]
+    ResponseType,
 }
 
 impl Error {

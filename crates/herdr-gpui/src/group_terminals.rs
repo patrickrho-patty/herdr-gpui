@@ -18,17 +18,15 @@ use crate::{
     HerdrWindow,
     browser::{GroupId, Pick, Scope, Shown, Slot},
     connection::ConnectionBridge,
-    presentation::Presentation,
+    presentation::{Picture, Presentation},
     state::{ConnectionStatus, LiveState},
     terminal::{popup_origin, viewport},
+    terminal_painter::{ImageTarget, PlacedImages},
 };
 use gpui::{prelude::*, *};
-use herdr_client::{ConnectOptions, Method, protocol::PaneSurfaceFrame};
+use herdr_client::{ConnectOptions, Method};
 use serde_json::json;
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 /// How long a parked connection waits for its tab before asking again.
 const REFOCUS_AFTER: Duration = Duration::from_secs(1);
@@ -36,6 +34,9 @@ const REFOCUS_AFTER: Duration = Duration::from_secs(1);
 const RETRY_AFTER: Duration = Duration::from_secs(2);
 /// Resizes settle for as long as the window's own do.
 const RESIZE_SETTLE: Duration = Duration::from_millis(150);
+/// A frame another client took is re-claimed more slowly than a settled
+/// resize, so the request is not resent while the daemon answers it.
+const RESIZE_REASSERT: Duration = Duration::from_secs(1);
 
 /// A terminal group's connection while another group has the keyboard.
 struct Parked {
@@ -59,6 +60,16 @@ impl Parked {
         self.connection.handle.is_some()
             && self.live.status.is_connected()
             && self.live.snapshot.is_some()
+    }
+
+    /// Whether the daemon's frame is the size this connection asked for.
+    /// Another client resizing the tab leaves the request stale even when
+    /// the connection's own options did not change.
+    fn surface_size_stale(&self) -> bool {
+        self.live.surface.as_ref().is_some_and(|surface| {
+            surface.frame.width != self.options.surface_size.cols
+                || surface.frame.height != self.options.surface_size.rows
+        })
     }
 
     /// The tab this connection focuses, when it is in `workspace`.
@@ -92,20 +103,23 @@ impl Parked {
         {
             self.asked = Some((tab.to_owned(), now));
         }
-        if self.last_queued_options == Some(self.options) {
+        let changed = self.last_queued_options != Some(self.options);
+        if self.last_queued_options == Some(self.options) && !self.surface_size_stale() {
             self.pending_resize = None;
             return;
         }
         match self.pending_resize {
-            Some((options, since))
-                if options == self.options && now.duration_since(since) >= RESIZE_SETTLE =>
-            {
-                if handle.resize(&boot, self.options).is_ok() {
+            Some((options, since)) if options == self.options => {
+                let wait = if changed {
+                    RESIZE_SETTLE
+                } else {
+                    RESIZE_REASSERT
+                };
+                if now.duration_since(since) >= wait && handle.resize(&boot, self.options).is_ok() {
                     self.last_queued_options = Some(self.options);
                     self.pending_resize = None;
                 }
             }
-            Some((options, _)) if options == self.options => {}
             _ => self.pending_resize = Some((self.options, now)),
         }
     }
@@ -148,6 +162,15 @@ impl HerdrWindow {
             .map(str::to_owned)
     }
 
+    /// Whether a parked connection already shows `tab`.
+    pub(crate) fn parked_focuses(&self, tab: &str) -> bool {
+        self.browser
+            .terminals
+            .parked
+            .iter()
+            .any(|parked| parked.focused_tab() == Some(tab))
+    }
+
     /// Whether `group` has a connection of its own on its way to its tab.
     pub(crate) fn group_connecting(&self, group: GroupId) -> bool {
         self.browser
@@ -155,6 +178,13 @@ impl HerdrWindow {
             .parked
             .iter()
             .any(|parked| parked.group == group)
+    }
+
+    /// Parked connections are clients of their own, each told the theme.
+    pub(crate) fn sync_group_host_theme(&self, theme: &herdr_client::HostTheme) {
+        for parked in &self.browser.terminals.parked {
+            parked.connection.sync_host_theme(&parked.live, theme);
+        }
     }
 
     /// Cheap enough for every display frame.
@@ -317,6 +347,11 @@ impl HerdrWindow {
                 update.notifications_lost = false;
                 update.sound_events.clear();
                 update.reload_sound = false;
+                update.clipboard_writes.clear();
+                // A parked client never holds the presentation, so a bell or
+                // title it saw belongs to no window.
+                update.bells = 0;
+                update.window_title = None;
                 update.dialog_response = None;
                 parked.live = update;
                 changed = true;
@@ -429,14 +464,14 @@ impl HerdrWindow {
     }
 
     /// The frame a parked group paints.
-    pub(crate) fn parked_frame(&mut self, group: GroupId) -> Option<Arc<PaneSurfaceFrame>> {
+    pub(crate) fn parked_frame(&mut self, group: GroupId) -> Option<Picture> {
         let parked = self
             .browser
             .terminals
             .parked
             .iter_mut()
             .find(|parked| parked.group == group)?;
-        parked.presentation.frame(&parked.live)
+        parked.presentation.picture(&parked.live)
     }
 
     /// Whether `group` shows a terminal through a parked connection.
@@ -481,8 +516,8 @@ impl HerdrWindow {
     pub(crate) fn live_frame_of(
         &mut self,
         tab: &str,
-        window_frame: Option<Arc<PaneSurfaceFrame>>,
-    ) -> Option<Arc<PaneSurfaceFrame>> {
+        window_frame: Option<Picture>,
+    ) -> Option<Picture> {
         if self.focused_herdr_tab() == Some(tab) {
             return window_frame;
         }
@@ -492,7 +527,7 @@ impl HerdrWindow {
             .parked
             .iter_mut()
             .find(|parked| parked.focused_tab() == Some(tab))?;
-        parked.presentation.frame(&parked.live)
+        parked.presentation.picture(&parked.live)
     }
 
     /// A group picking a tab another group shows paints a picture of it,
@@ -503,7 +538,7 @@ impl HerdrWindow {
         &mut self,
         slot: Slot,
         gap: f32,
-        surface: Option<Arc<PaneSurfaceFrame>>,
+        surface: Option<Picture>,
         font: Font,
         cell_height: f32,
         cx: &mut Context<Self>,
@@ -528,7 +563,7 @@ impl HerdrWindow {
         slot: Slot,
         name: &'static str,
         gap: f32,
-        surface: Option<Arc<PaneSurfaceFrame>>,
+        surface: Option<Picture>,
         place: bool,
         font: Font,
         cell_height: f32,
@@ -557,7 +592,11 @@ impl HerdrWindow {
                         }
                     },
                     move |bounds, _, window, cx| {
-                        let Some(surface) = &surface else {
+                        let Some(Picture {
+                            frame: surface,
+                            images,
+                        }) = &surface
+                        else {
                             return;
                         };
                         // A frame wider than the group stays inside it.
@@ -565,10 +604,16 @@ impl HerdrWindow {
                             painter.borrow_mut().paint_frame(
                                 &surface.frame,
                                 bounds.origin,
+                                Some(bounds.size),
                                 cell_width,
                                 &font,
                                 &[],
                                 &surface.panes,
+                                Some(PlacedImages {
+                                    placements: &surface.graphics.placements,
+                                    images,
+                                    target: ImageTarget::Main,
+                                }),
                                 window,
                                 cx,
                             );
@@ -582,10 +627,16 @@ impl HerdrWindow {
                                 painter.borrow_mut().paint_frame(
                                     &popup.frame,
                                     bounds.origin + offset,
+                                    None,
                                     cell_width,
                                     &font,
                                     &[],
                                     &[],
+                                    Some(PlacedImages {
+                                        placements: &surface.graphics.placements,
+                                        images,
+                                        target: ImageTarget::Popup(&popup.terminal_id),
+                                    }),
                                     window,
                                     cx,
                                 );
@@ -777,6 +828,45 @@ pub(crate) mod tests {
         assert_eq!(surface_size.cols, 100);
         assert_eq!(parked.last_queued_options, Some(parked.options));
         assert!(parked.pending_resize.is_none());
+    }
+
+    #[test]
+    fn a_parked_connection_reasks_a_size_another_client_overrode() {
+        let mut peer = MockPeer::new();
+        let snapshot = fixture_snapshot();
+        let workspace = snapshot.focused_workspace_id.clone().unwrap();
+        let tab = snapshot.focused_tab_id.clone().unwrap();
+        let mut ids = crate::browser::GroupIds::default();
+        let mut parked = parked(
+            ids.next(),
+            (Scope::endpoint("local"), workspace),
+            herdr_client::ConnectTarget::Socket("/unused-parked.sock".into()),
+            &peer,
+            snapshot,
+        );
+        // The connection's own request is already the queued one, but the
+        // daemon projects a frame of another size: another client resized
+        // the tab, so the request must go out again.
+        parked.options.surface_size.cols = 100;
+        parked.last_queued_options = Some(parked.options);
+        let now = Instant::now();
+        parked.steer(&tab, now);
+        assert_eq!(
+            peer.receive(),
+            ClientMessage::ClientShellFocus { focused: false }
+        );
+        assert!(parked.pending_resize.is_some());
+        parked.steer(&tab, now + RESIZE_SETTLE + Duration::from_millis(10));
+        assert!(
+            parked.pending_resize.is_some(),
+            "a frame of another size is not re-claimed before it has been answered"
+        );
+        parked.steer(&tab, now + RESIZE_REASSERT + Duration::from_millis(10));
+        let ClientMessage::ClientShellResize { surface_size, .. } = peer.receive() else {
+            panic!("expected a resize");
+        };
+        assert_eq!(surface_size.cols, 100);
+        assert_eq!(parked.last_queued_options, Some(parked.options));
     }
 
     /// The fixture window, connected and showing tab `t0` of `w0`.

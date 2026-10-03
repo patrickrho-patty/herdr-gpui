@@ -8,10 +8,9 @@ use crate::{
     config::{Config, FONT_SIZE_RANGE, FONT_SIZE_STEP, LayoutMode},
     controls::{self, Command},
     log_window,
+    menu::WorkspaceAction,
     navigation::{NavigationTarget, OwnedNavigationTarget},
-    open_additional_window,
-    sidebar::{sorted_agents, stepped_index},
-    state,
+    open_additional_window, state,
 };
 use gpui::{Context, Window};
 use std::time::Duration;
@@ -82,45 +81,6 @@ impl HerdrWindow {
         self.marked.clear();
         cx.notify();
         queued
-    }
-
-    /// Focuses the next agent row the sidebar paints, walking across hosts in
-    /// the panel's own order: hidden hosts skipped, each host's agents in the
-    /// selected sort. With no agent focused, forward starts at the top and
-    /// backward at the bottom.
-    pub(crate) fn focus_adjacent_agent(
-        &mut self,
-        forward: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let mut rows: Vec<(String, String)> = Vec::new();
-        let mut current = None;
-        for (index, endpoint) in self.endpoints.iter().enumerate() {
-            if !self.device_visible(&endpoint.id) {
-                continue;
-            }
-            let live = if index == self.selected_endpoint {
-                &self.live
-            } else {
-                &endpoint.live
-            };
-            let Some(snapshot) = &live.snapshot else {
-                continue;
-            };
-            for agent in sorted_agents(&snapshot.agents, self.agent_sort) {
-                if index == self.selected_endpoint && agent.focused {
-                    current = Some(rows.len());
-                }
-                rows.push((endpoint.id.clone(), agent.pane_id.clone()));
-            }
-        }
-        let Some(step) = stepped_index(current, rows.len(), forward) else {
-            return;
-        };
-        let (endpoint, pane) = rows.swap_remove(step);
-        self.navigate_endpoint(&endpoint, NavigationTarget::Pane(&pane), cx);
-        window.focus(&self.focus, cx);
     }
 
     /// `label` is what a failure is reported as, not a method name: navigation
@@ -292,6 +252,11 @@ impl HerdrWindow {
                 self.open_new_worktree(window, cx);
                 return;
             }
+            // Every interactive creation path ends here, so Herdr's name prompt
+            // covers buttons, menus, shortcuts, and the palette alike.
+            Command::Tab | Command::Workspace if self.open_name_prompt(command, window, cx) => {
+                return;
+            }
             Command::Keybinds => {
                 self.open_keybinds(window, cx);
                 return;
@@ -314,11 +279,22 @@ impl HerdrWindow {
                 self.open_about(window, cx);
                 return;
             }
-            Command::NextAgent | Command::PreviousAgent => {
-                self.focus_adjacent_agent(command == Command::NextAgent, window, cx);
+            Command::Find => {
+                self.open_find(window, cx);
                 return;
             }
-            Command::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
+            Command::CopyMode => {
+                self.enter_copy_mode(window, cx);
+                return;
+            }
+            Command::EditScrollback if !self.live.supports_edit_scrollback => {
+                self.show_flash(
+                    Flash::warning("Opening scrollback needs a newer Herdr daemon"),
+                    cx,
+                );
+                return;
+            }
+            Command::ToggleSidebar => self.toggle_sidebar(),
             Command::IncreaseFontSize | Command::DecreaseFontSize => {
                 let step = if command == Command::IncreaseFontSize {
                     FONT_SIZE_STEP
@@ -342,6 +318,65 @@ impl HerdrWindow {
                 cx.quit();
                 return;
             }
+            Command::RenameTab => {
+                self.rename_focused_tab(window, cx);
+                return;
+            }
+            Command::RenamePane => {
+                self.rename_focused_pane(window, cx);
+                return;
+            }
+            Command::RenameWorkspace | Command::CloseWorkspace => {
+                let action = if command == Command::RenameWorkspace {
+                    WorkspaceAction::Rename
+                } else {
+                    WorkspaceAction::Close
+                };
+                self.open_focused_workspace_dialog(action, window, cx);
+                return;
+            }
+            // As Herdr's binding does: the daemon rereads its file, and this
+            // client its own, which holds the daemon's `[keys]` too.
+            Command::ReloadConfig => {
+                self.reload_daemon_config();
+                self.load_gui_config(cx);
+                cx.notify();
+                return;
+            }
+            Command::ResizeMode => {
+                self.prefix_armed = false;
+                self.resize_mode = true;
+                cx.notify();
+                return;
+            }
+            Command::LastPane => {
+                // Herdr's check: the pane must still exist and not be focused.
+                if let Some(snapshot) = &self.live.snapshot
+                    && let Some(pane) = self.live.previous_pane.clone().filter(|pane| {
+                        snapshot.focused_pane_id.as_ref() != Some(pane)
+                            && snapshot.panes.iter().any(|p| p.pane_id == *pane)
+                    })
+                {
+                    self.navigate(NavigationTarget::Pane(&pane), cx);
+                }
+                window.focus(&self.focus, cx);
+                return;
+            }
+            Command::PreviousWorkspace
+            | Command::NextWorkspace
+            | Command::WorkspaceNumber(_)
+            | Command::PreviousAgent
+            | Command::NextAgent
+            | Command::AgentNumber(_) => {
+                self.step_sidebar(command, cx);
+                window.focus(&self.focus, cx);
+                return;
+            }
+            Command::MoveTabPrevious | Command::MoveTabNext if !self.live.supports_tab_move => {
+                self.local_error = Some("Moving tabs needs a newer Herdr daemon.".into());
+                cx.notify();
+                return;
+            }
             _ => {}
         }
         if self.activation_deadline.is_some()
@@ -359,6 +394,48 @@ impl HerdrWindow {
         }
         window.focus(&self.focus, cx);
         cx.notify();
+    }
+
+    /// Focuses the workspace or agent a sidebar step lands on, selecting its
+    /// host first when that is another one.
+    fn step_sidebar(&mut self, command: Command, cx: &mut Context<Self>) {
+        let agents = matches!(
+            command,
+            Command::PreviousAgent | Command::NextAgent | Command::AgentNumber(_)
+        );
+        let rows = if agents {
+            self.sidebar_agents()
+        } else {
+            self.sidebar_workspaces()
+        };
+        let selected = self.selected_endpoint;
+        let focused = self.live.snapshot.as_ref().and_then(|snapshot| {
+            if agents {
+                snapshot.focused_pane_id.as_deref()
+            } else {
+                snapshot.focused_workspace_id.as_deref()
+            }
+        });
+        let current = rows
+            .iter()
+            .position(|&(host, id)| host == selected && Some(id) == focused);
+        let Some(&(host, id)) = crate::sidebar::sidebar_step(&rows, current, selected, command)
+            .and_then(|index| rows.get(index))
+        else {
+            return;
+        };
+        let id = id.to_owned();
+        let target = if agents {
+            NavigationTarget::Pane(id.as_str())
+        } else {
+            NavigationTarget::Workspace(id.as_str())
+        };
+        if host == selected {
+            self.navigate(target, cx);
+        } else {
+            let endpoint = self.endpoints[host].id.clone();
+            self.navigate_endpoint(&endpoint, target, cx);
+        }
     }
 
     /// Installs the agent skill for browser tabs where Claude Code and other

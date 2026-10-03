@@ -1,16 +1,19 @@
 //! The sidebar: spaces and agents, the rows that show them, and the hover
 //! menu a resting pointer opens.
 
-mod agent_rows;
 mod agents;
 mod cell;
 mod hover;
 mod layout;
 mod layouts;
 mod metrics;
+mod order;
+pub(crate) mod preview;
+mod rail;
 mod render;
 mod reorder;
 mod row;
+mod tokens;
 mod view;
 mod workspaces;
 
@@ -24,22 +27,24 @@ pub(crate) mod layout_tests;
 pub(crate) mod native_tests;
 
 pub(crate) use {
-    agent_rows::AgentRows,
-    agents::{agent_name, sorted_agents, stepped_index},
+    agents::{Indicators, agent_name, state_label, status_indicator},
     hover::{HoverMenu, HoverRest},
-    metrics::{ARROW_RESERVE, HOST_ARROW_WIDTH, HOST_GAP, ICON_RESERVE, LABEL_GAP},
+    metrics::{ARROW_RESERVE, HOST_ARROW_WIDTH, HOST_GAP, ICON_RESERVE, LABEL_GAP, STATUS_WIDTH},
+    rail::SidebarMode,
     reorder::WorkspaceDrag,
     row::{compact, github_mark, label_text},
     view::SidebarView,
     workspaces::workspace_label,
 };
 
+pub(crate) use order::step as sidebar_step;
+
 #[cfg(any(test, feature = "integration-test"))]
 pub(crate) use metrics::LABEL_WIDTH;
 
 pub(crate) use view::cached as cached_view;
 
-use agents::{agents_sort, status_indicator, status_style};
+use agents::{agents_sort, sorted_agents};
 use metrics::*;
 use row::{RowBadge, first_text};
 use workspaces::visible_workspace_entries;

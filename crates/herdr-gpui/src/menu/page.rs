@@ -38,6 +38,8 @@ pub(crate) enum Page {
     Git,
     GitCommit,
     Dialog(WorkspaceAction),
+    /// Moving a linked worktree to another host.
+    Teleport,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +49,11 @@ pub(crate) enum WorkspaceAction {
     NewWorktree,
     OpenWorktree,
     DeleteWorktree,
+    /// Names a tab before `tab.create`, when `ui.prompt_new_tab_name` asks.
+    NewTab,
+    /// Names a workspace before `workspace.create`, when
+    /// `ui.prompt_new_workspace_name` asks. Targets the source workspace.
+    NewWorkspace,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +64,13 @@ pub(crate) enum WorkspaceMenuAction {
     Collapse,
     Expand,
     PullRequest,
+    Teleport,
+    /// Teleport the work back to the host it came from.
+    TeleportBack,
+    /// Focus the copy the work was teleported to.
+    GoToTeleported,
+    /// Forget that this checkout's work was teleported away.
+    ClearTeleported,
 }
 
 impl WorkspaceMenuAction {
@@ -69,8 +83,14 @@ impl WorkspaceMenuAction {
             Self::Dialog(WorkspaceAction::NewWorktree) => "icons/plus.svg",
             Self::Dialog(WorkspaceAction::OpenWorktree) => "icons/chevron-down.svg",
             Self::Dialog(WorkspaceAction::DeleteWorktree) => "icons/trash.svg",
+            Self::Dialog(WorkspaceAction::NewTab | WorkspaceAction::NewWorkspace) => {
+                "icons/plus.svg"
+            }
             Self::Collapse => "icons/chevron-up.svg",
             Self::Expand => "icons/chevron-down.svg",
+            Self::Teleport | Self::GoToTeleported => "icons/teleport.svg",
+            Self::TeleportBack => "icons/teleport-back.svg",
+            Self::ClearTeleported => "icons/x.svg",
             Self::PullRequest => return None,
         })
     }

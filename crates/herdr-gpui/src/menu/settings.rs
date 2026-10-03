@@ -10,18 +10,42 @@ use crate::{
 use gpui::{prelude::*, *};
 
 impl HerdrWindow {
+    pub(crate) fn reload_notification_config(&mut self, cx: &mut Context<Self>) {
+        self.sound.reload();
+        use crate::config::NotificationDelivery::Off;
+        let was_off = self.config.notifications.delivery() == Off;
+        if let Some(shared) = &self.settings.shared {
+            self.config.apply_shared_notifications(shared);
+        }
+        let now = std::time::Instant::now();
+        for endpoint in &mut self.endpoints {
+            // Turning delivery on, in-app or system, never replays the backlog.
+            if was_off && self.config.notifications.delivery() != Off {
+                endpoint.toasts.enabled_since = Some(now);
+            }
+        }
+        self.tick_toasts(self.menu.page.is_some() || self.toasts_hidden, now);
+        cx.notify();
+    }
+
+    /// Reloads when the GUI overrides change, or the daemon's config whose
+    /// `[keys]`, clipboard toast, and `[ui.sidebar]` rows the GUI also honors.
     pub(crate) fn watch_gui_config(&mut self, cx: &mut Context<Self>) {
         let Ok(path) = Config::local_path() else {
             return;
         };
+        let daemon = crate::config::daemon_config_path(|key| std::env::var_os(key));
         let executor = cx.background_executor().clone();
         self.config_watch = Some(cx.spawn(async move |this, cx| {
             let mut watch = crate::config::watch::Watch::default();
             let mut pending = None;
             loop {
-                let path = path.clone();
+                let (path, daemon) = (path.clone(), daemon.clone());
                 let sample = executor
-                    .spawn(async move { crate::config::watch::fingerprint(&path) })
+                    .spawn(async move {
+                        use crate::config::watch::fingerprint;
+                        [fingerprint(&path), fingerprint(&daemon)]
+                    })
                     .await;
                 let updated = this.update(cx, |this, cx| {
                     if let Some((sample, revision)) = pending
@@ -32,11 +56,14 @@ impl HerdrWindow {
                     }
                     if watch.observe(sample)
                         && this.config_load.is_none()
+                        && this.settings.task.is_none()
                         && !this.font_size_saves.is_busy()
                         && !matches!(this.menu.page, Some(Page::Themes | Page::Fonts))
                         && !this.theme_save_in_flight()
+                        && !this.native_settings_save_in_flight()
                     {
                         this.load_gui_config(cx);
+                        this.load_shared_settings(cx);
                         pending = Some((sample, this.config_load_revision));
                     }
                 });
@@ -71,11 +98,23 @@ impl HerdrWindow {
     }
 
     pub(crate) fn open_preferences(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.theme_save_in_flight() {
+            return;
+        }
+        self.dismiss_menu(window, cx);
+        crate::settings_window::open(cx.weak_entity(), cx);
+    }
+
+    // Existing modal font/theme pickers still return to their own preferences page.
+    #[cfg(any(test, all(feature = "integration-test", target_os = "macos")))]
+    pub(crate) fn open_preferences_fixture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.open_menu(window, cx) {
             return;
         }
         self.menu.page = Some(Page::Preferences);
         self.menu.preferences_scroll.set_offset(Point::default());
+        self.load_shared_settings(cx);
+        self.select_settings_tab(self.settings.tab, window, cx);
     }
 
     pub(crate) fn change_font_size(
@@ -91,7 +130,7 @@ impl HerdrWindow {
     }
 
     pub(crate) fn reload_gui_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.theme_save_in_flight() {
+        if self.theme_save_in_flight() || self.native_settings_save_in_flight() {
             return;
         }
         self.load_gui_config(cx);
@@ -99,6 +138,9 @@ impl HerdrWindow {
     }
 
     pub(crate) fn load_gui_config(&mut self, cx: &mut Context<Self>) {
+        if self.native_settings_save_in_flight() {
+            return;
+        }
         // Enumerating installed families is slow, so it rides the same
         // background load as parsing rather than the UI thread.
         let text_system = cx.text_system().clone();
@@ -106,7 +148,12 @@ impl HerdrWindow {
             move || {
                 let mut config = Config::load()?;
                 config.resolve_font_fallbacks(|| text_system.all_font_names());
-                let theme = config.theme()?;
+                // Follow Herdr is resolved from the latest prepared snapshot on completion.
+                let theme = if config.theme == "Follow Herdr" {
+                    Default::default()
+                } else {
+                    config.theme()?
+                };
                 Ok((config, theme))
             },
             cx,
@@ -121,15 +168,23 @@ impl HerdrWindow {
         if self.config_load.is_some() || self.font_size_saves.is_busy() {
             return;
         }
+        let theme_revision = crate::settings_window::theme_load_revision(cx);
+        let layout_revision = crate::settings_window::layout_load_revision(cx);
         let load = cx.background_executor().spawn(async move { load() });
         self.config_load = Some(cx.spawn(async move |this, cx| {
             let loaded = load.await;
             let _ = this.update(cx, |this, cx| {
                 this.config_load = None;
+                let native_reload = std::mem::take(&mut this.settings.native_reloading);
                 this.config_load_revision = this.config_load_revision.wrapping_add(1);
                 // Apply a coherent pair only after both have loaded successfully.
                 match loaded {
-                    Ok((mut config, theme)) => {
+                    Ok((mut config, mut theme)) => {
+                        crate::settings_window::apply_loaded_layout(&mut config, layout_revision, cx);
+                        crate::settings_window::apply_loaded_theme(&mut config, &mut theme, theme_revision, cx);
+                        if let Some(shared) = &this.settings.shared {
+                            config.apply_shared_notifications(shared);
+                        }
                         // A reload discards session zoom; queued Settings edits
                         // remain visible but do not become the saved baseline yet.
                         this.configured_terminal_size = config.terminal.size;
@@ -144,19 +199,37 @@ impl HerdrWindow {
                             // The View menu checks the layout in use.
                             crate::menus::install(cx);
                         }
-                        if !this.config.notifications.enabled && config.notifications.enabled {
+                        if this.config.notifications.delivery() == crate::config::NotificationDelivery::Off
+                            && config.notifications.delivery() != crate::config::NotificationDelivery::Off
+                        {
                             let cutoff = std::time::Instant::now();
                             for endpoint in &mut this.endpoints {
                                 endpoint.toasts.enabled_since = Some(cutoff);
                             }
                         }
+                        this.config = config.clone();
+                        if this.config.theme != "Follow Herdr" {
+                            this.theme = theme;
+                        }
+                        this.apply_shared_theme(cx);
+                        crate::settings_window::apply_loaded_theme(&mut this.config, &mut this.theme, theme_revision, cx);
+                        cx.set_global(crate::app::InitialAppearance {
+                            config: this.config.clone(),
+                            theme: this.theme.clone(),
+                            error: None,
+                        });
                         this.font_size_saves.apply_pending(&mut config);
                         this.config = config;
+                        this.gui_config_diagnostic.sync(this.config.diagnostic().as_deref());
+                        crate::settings_window::apply_loaded_theme(&mut this.config, &mut this.theme, theme_revision, cx);
                         this.tick_toasts(
                             this.menu.page.is_some() || this.toasts_hidden,
                             std::time::Instant::now(),
                         );
-                        this.theme = theme;
+                        if native_reload {
+                            this.settings.native_status =
+                                Some("GUI config saved and applied".into());
+                        }
                         crate::log_window::set_appearance(&this.config, &this.theme, cx);
                         this.wheel = Default::default();
                         this.last_queued_options = None;
@@ -164,7 +237,13 @@ impl HerdrWindow {
                     }
                     Err(error) => {
                         tracing::warn!(%error, "Could not load GUI config; keeping current settings");
-                        this.local_error = Some(format!("Load GUI config: {error}"));
+                        let message = format!("Load GUI config: {error}");
+                        if native_reload {
+                            this.settings.native_status =
+                                Some("GUI config saved; appearance reload failed".into());
+                            this.settings.native_error = Some(message.clone());
+                        }
+                        this.local_error = Some(message);
                     }
                 }
                 // A config another build wrote, such as a setting this version
@@ -217,13 +296,7 @@ impl HerdrWindow {
             ("APPLICATION", vec![(vec!["cmd-v"], "Paste into terminal")]),
         ];
         for info in COMMANDS {
-            let keys: Vec<&str> = self
-                .config
-                .keybindings
-                .shortcuts(info.command)
-                .iter()
-                .map(String::as_str)
-                .collect();
+            let keys: Vec<&str> = self.keymap().shortcuts(info.command).collect();
             if keys.is_empty() {
                 continue;
             }
@@ -235,10 +308,28 @@ impl HerdrWindow {
                 | Command::SplitDown
                 | Command::Zoom
                 | Command::ClearPane
+                | Command::Find
+                | Command::CopyMode
+                | Command::EditScrollback
                 | Command::ClosePane
                 | Command::CloseTab
                 | Command::NewBrowserTab
-                | Command::SplitEditor => 0,
+                | Command::SplitEditor
+                | Command::MoveTabPrevious
+                | Command::MoveTabNext
+                | Command::RenameTab
+                | Command::SwapLeft
+                | Command::SwapRight
+                | Command::SwapUp
+                | Command::SwapDown
+                | Command::ResizeLeft
+                | Command::ResizeRight
+                | Command::ResizeUp
+                | Command::ResizeDown
+                | Command::ResizeMode
+                | Command::RenamePane
+                | Command::RenameWorkspace
+                | Command::CloseWorkspace => 0,
                 Command::NextTab
                 | Command::PreviousTab
                 | Command::FocusLeft
@@ -247,10 +338,15 @@ impl HerdrWindow {
                 | Command::FocusDown
                 | Command::NextPane
                 | Command::PreviousPane
-                | Command::NextAgent
-                | Command::PreviousAgent
                 | Command::TabNumber(_)
-                | Command::WorkspacePicker => 1,
+                | Command::WorkspacePicker
+                | Command::LastPane
+                | Command::PreviousWorkspace
+                | Command::NextWorkspace
+                | Command::WorkspaceNumber(_)
+                | Command::PreviousAgent
+                | Command::NextAgent
+                | Command::AgentNumber(_) => 1,
                 Command::NewWindow
                 | Command::ToggleSidebar
                 | Command::IncreaseFontSize
@@ -265,7 +361,8 @@ impl HerdrWindow {
                 | Command::Quit
                 | Command::Logs
                 | Command::About
-                | Command::InstallBrowserSkill => 2,
+                | Command::InstallBrowserSkill
+                | Command::ReloadConfig => 2,
                 Command::OpenNotificationTarget => 1,
             };
             groups[group].1.push((keys, info.label));
@@ -352,7 +449,7 @@ impl HerdrWindow {
             div()
                 .py(px(14.))
                 .text_color(rgb(theme.muted))
-                .child("Native GUI shortcuts only. Terminal applications and daemon/TUI keybindings keep their own shortcuts."),
+                .child("Includes the prefix chords from Herdr's [keys] in config.toml. Daemon actions with no GUI command, and terminal applications, keep their own shortcuts."),
         );
         div()
             .flex()
@@ -445,17 +542,24 @@ impl HerdrWindow {
     }
 }
 
-/// The keycaps of one keystroke, capitalized for display. `cmd--` splits into
-/// `cmd` and a `-` key rather than an empty cap.
-fn keycaps(keystroke: &str) -> impl Iterator<Item = String> + '_ {
-    let (modifiers, key) = match keystroke.strip_suffix("--") {
-        Some(modifiers) => (modifiers, "-"),
-        None => keystroke.rsplit_once('-').unwrap_or(("", keystroke)),
-    };
-    modifiers
-        .split('-')
-        .filter(|modifier| !modifier.is_empty())
-        .chain(std::iter::once(key))
+/// The keycaps of a shortcut, capitalized for display, a prefix chord's
+/// keystrokes in turn. `cmd--` splits into `cmd` and a `-` key rather than an
+/// empty cap, as does a chord's bare `-`.
+fn keycaps(shortcut: &str) -> impl Iterator<Item = String> + '_ {
+    shortcut
+        .split(' ')
+        .flat_map(|keystroke| {
+            let (modifiers, key) = match keystroke.strip_suffix('-') {
+                Some(modifiers) if modifiers.is_empty() || modifiers.ends_with('-') => {
+                    (modifiers, "-")
+                }
+                _ => keystroke.rsplit_once('-').unwrap_or(("", keystroke)),
+            };
+            modifiers
+                .split('-')
+                .filter(|modifier| !modifier.is_empty())
+                .chain(std::iter::once(key))
+        })
         .map(|key| {
             let mut chars = key.chars();
             chars
@@ -477,7 +581,7 @@ fn shortcut_matches(query: &str, keys: &str, description: &str, section: &str) -
         // A key combination should match keycaps, not letters in an action's name.
         return query
             .split_whitespace()
-            .all(|token| keys.split('-').any(|key| key == token));
+            .all(|token| keys.split(['-', ' ']).any(|key| key == token));
     }
     let text = format!("{keys} {description} {section}")
         .to_lowercase()
@@ -554,6 +658,50 @@ mod tests {
                 assert!(view.endpoints[0].toasts.entries[0].1.visible);
             });
         }
+    }
+
+    #[gpui::test]
+    fn enabling_system_delivery_does_not_post_the_backlog(cx: &mut gpui::TestAppContext) {
+        use crate::{
+            config::{Config, NotificationDelivery},
+            notifications::{Notice, take_system, tests::notification},
+        };
+        use std::time::Instant;
+        let (view, cx) = cx.add_window_view(crate::sidebar::layout_tests::fixture_window);
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.config.notifications.delivery(),
+                NotificationDelivery::Off
+            );
+            let mut wire = notification("while off");
+            wire.kind = herdr_client::protocol::SemanticNotificationKind::Custom;
+            view.endpoints[0]
+                .toasts
+                .receive([Notice::new(wire, Instant::now())]);
+        });
+        view.update(cx, |view, cx| {
+            view.load_gui_config_with(
+                || {
+                    let mut config = Config::default();
+                    config.notifications.system = true;
+                    config.notifications.delay_seconds = 0;
+                    let theme = config.theme()?;
+                    Ok((config, theme))
+                },
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.config.notifications.delivery(),
+                NotificationDelivery::System
+            );
+            assert!(view.endpoints[0].toasts.enabled_since.is_some());
+            view.tick_toasts(false, Instant::now());
+            assert!(take_system(&mut view.endpoints, view.config.notifications).is_empty());
+            assert!(view.endpoints[0].toasts.entries.is_empty());
+        });
     }
 
     #[gpui::test]
@@ -794,6 +942,9 @@ mod tests {
         assert_eq!(caps("cmd--"), ["Cmd", "-"]);
         assert_eq!(caps("cmd-+"), ["Cmd", "+"]);
         assert_eq!(caps("f5"), ["F5"]);
+        assert_eq!(caps("ctrl-b c"), ["Ctrl", "B", "C"]);
+        assert_eq!(caps("ctrl-b -"), ["Ctrl", "B", "-"]);
+        assert_eq!(caps("ctrl-b shift-tab"), ["Ctrl", "B", "Shift", "Tab"]);
     }
 
     /// A saved `[keybindings]` change must reach the live keymap, the palette,
@@ -834,7 +985,10 @@ mod tests {
                     .map(|(name, binding)| (name.to_owned(), binding))
                     .collect();
                     let config = Config {
-                        keybindings: Keymap::with_overrides(&overrides)?,
+                        keybindings: Keymap::with_overrides(
+                            &overrides,
+                            &crate::keymap::DaemonKeys::default(),
+                        )?,
                         ..Config::default()
                     };
                     Ok((config, Default::default()))
@@ -855,7 +1009,8 @@ mod tests {
         });
         view.read_with(cx, |view, _| {
             assert_eq!(view.config.keybindings.primary(Command::Workspace), "cmd-t");
-            assert_eq!(view.config.keybindings.primary(Command::Tab), "");
+            // Only Herdr's default chord is left once cmd-t moves away.
+            assert_eq!(view.config.keybindings.primary(Command::Tab), "ctrl-b c");
         });
 
         view.update(cx, |view, cx| {

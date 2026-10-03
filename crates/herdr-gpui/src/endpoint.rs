@@ -5,7 +5,7 @@ use super::{
     state::ConnectionStatus,
 };
 use crate::{Error, Result};
-use gpui::Context;
+use gpui::{ClipboardItem, Context};
 use herdr_client::{ClientHandle, ConnectOptions, ConnectTarget, SavedHost};
 use std::{
     collections::HashSet,
@@ -134,6 +134,8 @@ pub(super) struct Endpoint {
     pub live: LiveState,
     pub generation: u64,
     pub(crate) toasts: crate::notifications::Toasts,
+    /// Derived from `live.snapshot`; refreshed by `sync_live` whenever `live` changes.
+    pub(crate) config_diagnostic: crate::config_diagnostic::ConfigDiagnostic,
     retry_at: Instant,
     attempts: u32,
     online_since: Option<Instant>,
@@ -158,7 +160,18 @@ impl Endpoint {
     ) {
         std::mem::swap(&mut self.connection, connection);
         std::mem::swap(&mut self.live, live);
+        self.sync_live();
         self.initial_surface = true;
+    }
+
+    /// Refreshes state derived from `live` after it is replaced.
+    pub(crate) fn sync_live(&mut self) {
+        self.config_diagnostic.sync(
+            self.live
+                .snapshot
+                .as_deref()
+                .and_then(|snapshot| snapshot.config_diagnostic.as_deref()),
+        );
     }
     pub fn new(id: String, label: String, target: ConnectTarget, enabled: bool) -> Self {
         Self {
@@ -172,6 +185,7 @@ impl Endpoint {
             live: LiveState::default(),
             generation: 0,
             toasts: Default::default(),
+            config_diagnostic: Default::default(),
             retry_at: Instant::now(),
             attempts: 0,
             online_since: None,
@@ -188,6 +202,7 @@ impl Endpoint {
         self.online_since = None;
         self.generation += 1;
         self.live = self.connection.take_update().unwrap_or_default();
+        self.sync_live();
     }
 
     /// The SSH target and session this device was saved with. The sessions list
@@ -215,6 +230,7 @@ impl Endpoint {
         self.attempts = 0;
         // The replacement transport has produced no state of its own yet.
         self.live = LiveState::default();
+        self.sync_live();
     }
 
     fn connect(&mut self, options: ConnectOptions, active: bool) {
@@ -224,6 +240,7 @@ impl Endpoint {
         self.attempts = self.attempts.saturating_add(1);
         self.connection.reconnect(options, false, active);
         self.live = self.connection.take_update().unwrap_or_default();
+        self.sync_live();
         self.toasts.receive(self.live.notifications.drain(..));
         self.retry_at = Instant::now() + self.retry_delay();
     }
@@ -249,6 +266,7 @@ impl Endpoint {
             }
             self.toasts.receive(state.notifications.drain(..));
             self.live = state;
+            self.sync_live();
         }
         if self
             .connection
@@ -730,11 +748,17 @@ impl HerdrWindow {
     // A coherent surface permits the deferred navigation attempt, not terminal
     // input while its toast target is still waiting for inbox validation.
     pub(crate) fn navigation_ready(&self) -> bool {
-        self.surface_activation_ready()
-            && self.live.surface.as_ref().is_some_and(|surface| {
-                surface.frame.width == self.options.surface_size.cols
-                    && surface.frame.height == self.options.surface_size.rows
-            })
+        self.surface_activation_ready() && self.surface_matches_options()
+    }
+
+    /// Whether the daemon's frame is the size this client asked for. A
+    /// mismatch means someone else resized the tab (a CLI, or another
+    /// window): the size has to be asked for again, not only waited on.
+    pub(crate) fn surface_matches_options(&self) -> bool {
+        self.live.surface.as_ref().is_some_and(|surface| {
+            surface.frame.width == self.options.surface_size.cols
+                && surface.frame.height == self.options.surface_size.rows
+        })
     }
 
     pub(crate) fn surface_activation_ready(&self) -> bool {
@@ -745,6 +769,27 @@ impl HerdrWindow {
             && self.endpoints[self.selected_endpoint].surface_requested()
             && self.pending_releases.is_empty()
             && self.live.surface_ready()
+    }
+
+    /// Writes daemon-forwarded OSC 52 payloads to the pasteboard and reports
+    /// the copy the way a local selection does. Returns whether anything was
+    /// written, so the window repaints for the flash.
+    fn apply_clipboard_writes(
+        &mut self,
+        writes: impl IntoIterator<Item = String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mut writes = writes.into_iter().peekable();
+        if writes.peek().is_none() {
+            return false;
+        }
+        for text in writes {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+        if self.config.clipboard_toast.enabled {
+            self.show_flash(crate::window::Flash::success("copied to clipboard"), cx);
+        }
+        true
     }
 
     pub(super) fn poll_endpoints(&mut self, cx: &mut Context<Self>) {
@@ -773,8 +818,18 @@ impl HerdrWindow {
         // inbox being busy for a poll, must not replace what the window has
         // stamped since, such as the split drag request it is waiting on.
         let mut selected_changed = false;
+        // OSC 52 writes are drained per endpoint so they are written once and
+        // never linger in a live state that a later poll would re-read.
+        let mut clipboard_writes = std::collections::VecDeque::new();
         for (index, endpoint) in self.endpoints.iter_mut().enumerate() {
             let updated = endpoint.poll(Instant::now());
+            clipboard_writes.append(&mut endpoint.live.clipboard_writes);
+            // Bells are a presentation effect: only the selected endpoint's
+            // ring, as the TUI drops them from inactive endpoints.
+            let bells = std::mem::take(&mut endpoint.live.bells);
+            if index == self.selected_endpoint {
+                self.bell.queue(bells);
+            }
             selected_changed |= index == self.selected_endpoint && updated != Redraw::None;
             self.sound.poll(
                 &mut endpoint.sounds,
@@ -802,6 +857,9 @@ impl HerdrWindow {
                 selected_changed |= index == self.selected_endpoint;
                 changed = Redraw::Window;
             }
+        }
+        if self.apply_clipboard_writes(clipboard_writes, cx) {
+            changed = Redraw::Window;
         }
         self.restore_selection(cx);
         if self.tick_toasts(
@@ -892,6 +950,7 @@ impl HerdrWindow {
             self.local_error = Some(error);
             changed = Redraw::Window;
         }
+        self.sync_server_keymap(cx);
         match changed {
             Redraw::None => {}
             Redraw::Terminal => self.redraw_terminal(cx),
@@ -1115,6 +1174,7 @@ mod tests {
             0,
             config,
             false,
+            true,
             None,
             now
         ));
@@ -1124,10 +1184,40 @@ mod tests {
             0,
             config,
             false,
+            true,
             None,
             deadline
         ));
         assert!(endpoints[1].toasts.entries.is_empty());
+    }
+
+    /// A pane app's OSC 52 copy reaches the pasteboard and reports the same
+    /// copy a local selection does, unless the toast is configured off.
+    #[gpui::test]
+    fn daemon_clipboard_writes_reach_the_pasteboard_and_report(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(crate::sidebar::layout_tests::fixture_window);
+        view.update(cx, |view, cx| {
+            assert!(view.apply_clipboard_writes(vec!["hello".into()], cx));
+            assert!(
+                view.flash.is_some(),
+                "the copy is reported like a selection"
+            );
+        });
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("hello".into())
+        );
+        view.update(cx, |view, cx| {
+            view.config.clipboard_toast.enabled = false;
+            view.flash = None;
+            assert!(view.apply_clipboard_writes(vec!["quiet".into()], cx));
+            assert!(view.flash.is_none(), "a disabled toast stays silent");
+            assert!(!view.apply_clipboard_writes(Vec::new(), cx));
+        });
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("quiet".into())
+        );
     }
 
     #[test]
