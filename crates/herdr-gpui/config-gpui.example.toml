@@ -20,7 +20,10 @@ theme = "Default"
 # Ask before closing a tab (closing terminates its terminal processes).
 # Pane close confirmation is independent and remains enabled.
 confirm_close_tab = true
-# Show the Agents section below Spaces in the sidebar.
+# Show the Agents section below Spaces in the sidebar. Its rows follow the
+# daemon config's [ui.sidebar.agents] rows, styles, and row_gap, so both
+# clients paint the same panel; malformed rules fall back to the upstream
+# defaults.
 show_agents = true
 # macOS only: whether Option-letter reaches a pane as an Alt shortcut (Alt-P
 # for Option-P) or types the character the keyboard layout puts there. "auto"
@@ -101,7 +104,8 @@ position = "bottom-right"
 # command_palette = "cmd-shift-p"
 # open_notification_target = "cmd-alt-n"
 # quit = "cmd-q"
-# Unbound by default: themes, reconnect, logs, about.
+# Unbound by default: themes, reconnect, logs, about, next_agent, previous_agent.
+# Upstream Herdr walks the sidebar's agent rows with alt-j and alt-k.
 
 # Preferences offers a searchable picker for all four families together or each row.
 # Platform default removes the local family override; fallback cascades remain active.

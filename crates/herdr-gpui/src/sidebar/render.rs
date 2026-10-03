@@ -191,6 +191,7 @@ impl HerdrWindow {
                 width,
                 host: (multi && endpoint_id != crate::endpoint::LOCAL)
                     .then_some(endpoint.label.as_str()),
+                agent_rows: &self.config.agent_rows,
             };
             let live = if selected { &self.live } else { &endpoint.live };
             let Some(snapshot) = &live.snapshot else {
@@ -460,6 +461,11 @@ impl HerdrWindow {
                 agent_count += 1;
                 let id = agent.pane_id.clone();
                 let navigate_endpoint = endpoint_id.clone();
+                let pane_label = snapshot
+                    .panes
+                    .iter()
+                    .find(|pane| pane.pane_id == agent.pane_id)
+                    .and_then(|pane| pane.label.as_deref());
                 agents = agents.child(
                     Cell::new(
                         rows,
@@ -469,6 +475,8 @@ impl HerdrWindow {
                             icon: crate::icons::AgentIcon::from_identity(agent.agent.as_deref()),
                             status: agent.agent_status,
                             place: agent_place(agent, snapshot),
+                            source: agent,
+                            pane_label,
                         }),
                         &row_cx,
                     )

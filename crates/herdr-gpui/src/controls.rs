@@ -17,6 +17,8 @@ pub enum Command {
     FocusDown,
     NextPane,
     PreviousPane,
+    NextAgent,
+    PreviousAgent,
     Zoom,
     ClearPane,
     ClosePane,
@@ -147,6 +149,18 @@ pub const COMMANDS: &[CommandInfo] = &[
         name: "previous_pane",
         label: "Previous Pane",
         shortcuts: &["cmd-alt-["],
+    },
+    CommandInfo {
+        command: Command::NextAgent,
+        name: "next_agent",
+        label: "Next Agent",
+        shortcuts: &[],
+    },
+    CommandInfo {
+        command: Command::PreviousAgent,
+        name: "previous_agent",
+        label: "Previous Agent",
+        shortcuts: &[],
     },
     CommandInfo {
         command: Command::Zoom,
@@ -423,6 +437,8 @@ pub fn request(command: Command, snapshot: &ClientShellSnapshot) -> Option<(Meth
         }
         Command::NewWindow
         | Command::NewWorktree
+        | Command::NextAgent
+        | Command::PreviousAgent
         | Command::ToggleSidebar
         | Command::IncreaseFontSize
         | Command::DecreaseFontSize
@@ -459,7 +475,7 @@ mod tests {
     #[test]
     fn catalog_has_all_native_commands_and_gpui_shortcuts() {
         use Command::*;
-        let expected: [(Command, &[&str]); 45] = [
+        let expected: [(Command, &[&str]); 47] = [
             (OpenNotificationTarget, &["cmd-alt-n"]),
             (Logs, &[]),
             (NewWindow, &["cmd-alt-shift-n"]),
@@ -476,6 +492,8 @@ mod tests {
             (FocusDown, &["cmd-alt-down"]),
             (NextPane, &["cmd-alt-]"]),
             (PreviousPane, &["cmd-alt-["]),
+            (NextAgent, &[]),
+            (PreviousAgent, &[]),
             (Zoom, &["cmd-shift-enter"]),
             (ClearPane, &["cmd-k"]),
             (ClosePane, &["cmd-w"]),
@@ -554,6 +572,8 @@ mod tests {
             Command::Logs,
             Command::NewWindow,
             Command::NewWorktree,
+            Command::NextAgent,
+            Command::PreviousAgent,
             Command::ToggleSidebar,
             Command::IncreaseFontSize,
             Command::DecreaseFontSize,

@@ -247,6 +247,8 @@ impl HerdrWindow {
                 | Command::FocusDown
                 | Command::NextPane
                 | Command::PreviousPane
+                | Command::NextAgent
+                | Command::PreviousAgent
                 | Command::TabNumber(_)
                 | Command::WorkspacePicker => 1,
                 Command::NewWindow

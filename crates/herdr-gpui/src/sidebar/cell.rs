@@ -20,7 +20,7 @@ use crate::{
     icons::AgentIcon,
 };
 use gpui::{App, ClickEvent, Div, ElementId, Window};
-use herdr_client::protocol::{AgentStatus, ClientShellWorkspace};
+use herdr_client::protocol::{AgentStatus, ClientShellAgent, ClientShellWorkspace};
 
 /// Read-only inputs every row of one render shares.
 pub(super) struct RowContext<'a> {
@@ -33,6 +33,8 @@ pub(super) struct RowContext<'a> {
     /// The host these rows live on, named only while several hosts are
     /// listed and this one is remote, so a single-host sidebar stays quiet.
     pub(super) host: Option<&'a str>,
+    /// The daemon's agent row rules, which the classic layout paints.
+    pub(super) agent_rows: &'a crate::sidebar::AgentRows,
 }
 
 /// A click listener, erased so rows of every group share one type.
@@ -87,6 +89,11 @@ pub(super) struct AgentRow<'a> {
     /// Its workspace and, when that earns a place, its tab. Missing once the
     /// workspace has gone.
     pub(super) place: Option<(&'a str, Option<&'a str>)>,
+    /// The snapshot row the token rules read: titles, metadata tokens, state
+    /// labels, and the canonical id `rows_by_agent` matches.
+    pub(super) source: &'a ClientShellAgent,
+    /// The pane's label, when it still exists, for the `pane` token.
+    pub(super) pane_label: Option<&'a str>,
 }
 
 /// What a row shows.

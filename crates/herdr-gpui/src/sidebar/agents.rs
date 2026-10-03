@@ -50,7 +50,7 @@ pub(super) fn status_priority(status: AgentStatus) -> u8 {
 }
 
 /// The agents of one endpoint in the order the panel paints them.
-pub(super) fn sorted_agents(
+pub(crate) fn sorted_agents(
     agents: &[ClientShellAgent],
     sort: crate::preferences::AgentSort,
 ) -> Vec<&ClientShellAgent> {
@@ -64,6 +64,18 @@ pub(super) fn sorted_agents(
         });
     }
     ordered
+}
+
+/// The row a `next_agent` / `previous_agent` step lands on, wrapping at both
+/// ends. With no focused agent, forward starts at the top of the list and
+/// backward at the bottom.
+pub(crate) fn stepped_index(current: Option<usize>, len: usize, forward: bool) -> Option<usize> {
+    (len > 0).then(|| match (current, forward) {
+        (Some(index), true) => (index + 1) % len,
+        (Some(index), false) => (index + len - 1) % len,
+        (None, true) => 0,
+        (None, false) => len - 1,
+    })
 }
 
 /// What an agent is called wherever it is listed.
@@ -104,27 +116,6 @@ pub(super) fn agent_place<'a>(
     Some((workspace.label.as_str(), tab))
 }
 
-/// Upstream's default agent rows: host, workspace and tab on the first line,
-/// the agent itself on the second. A pane whose workspace has gone leaves the
-/// agent to name the row.
-pub(super) fn agent_labels<'a>(
-    name: &'a str,
-    place: Option<(&'a str, Option<&'a str>)>,
-    host: Option<&'a str>,
-) -> (Vec<(&'a str, bool)>, &'a str) {
-    let Some((workspace, tab)) = place else {
-        return (vec![(name, true)], "");
-    };
-    // Only the workspace carries the row's weight: upstream paints the host and
-    // tab around it in its secondary color.
-    let segments = [(host, false), (Some(workspace), true), (tab, false)]
-        .into_iter()
-        .filter_map(|(text, primary)| Some((text?, primary)))
-        .filter(|(text, _)| !text.is_empty())
-        .collect();
-    (segments, name)
-}
-
 // Match the expanded upstream shell order, including orphaned linked worktrees.
 
 pub(super) fn status_indicator(status: AgentStatus, font: &FontConfig) -> Div {
@@ -158,5 +149,21 @@ pub(super) fn status_style(status: AgentStatus) -> (f32, bool, u32) {
         AgentStatus::Done => (STATUS_WIDTH, true, 0x94e2d5),
         AgentStatus::Idle => (STATUS_WIDTH, false, 0xa6e3a1),
         AgentStatus::Unknown => (STATUS_DOT_UNKNOWN, true, 0x6c7086),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stepped_index;
+
+    #[test]
+    fn agent_steps_wrap_and_start_at_an_end_when_nothing_is_focused() {
+        assert_eq!(stepped_index(Some(1), 3, true), Some(2));
+        assert_eq!(stepped_index(Some(2), 3, true), Some(0));
+        assert_eq!(stepped_index(Some(1), 3, false), Some(0));
+        assert_eq!(stepped_index(Some(0), 3, false), Some(2));
+        assert_eq!(stepped_index(None, 3, true), Some(0));
+        assert_eq!(stepped_index(None, 3, false), Some(2));
+        assert_eq!(stepped_index(None, 0, true), None);
     }
 }

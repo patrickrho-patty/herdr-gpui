@@ -4,10 +4,9 @@
 
 use super::super::{
     ARROW_RESERVE,
-    agents::agent_labels,
     cell::{AgentRow, RowContext, RowLayout, RowState, WorkspaceRow},
     line_height,
-    row::{RowIcon, RowKind, RowTree},
+    row::RowKind,
 };
 use gpui::{prelude::*, *};
 
@@ -54,23 +53,7 @@ impl RowLayout for Herdr {
     }
 
     fn agent(&self, agent: AgentRow<'_>, state: RowState, cx: &RowContext<'_>) -> Div {
-        let (name, detail) = agent_labels(agent.name, agent.place, cx.host);
-        super::super::row::row(
-            &agent.key,
-            &name,
-            detail,
-            RowKind::Agent(agent.icon),
-            agent.status,
-            false,
-            state,
-            RowTree::None,
-            false,
-            cx.width,
-            RowIcon::None,
-            None,
-            None,
-            cx.look,
-            (cx.font, cx.theme),
-        )
+        let rules = cx.agent_rows.for_agent(agent.source.agent.as_deref());
+        super::super::row::agent_rules(&agent.key, rules, &agent, state, cx)
     }
 }

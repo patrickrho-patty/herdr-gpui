@@ -1,18 +1,11 @@
 #![allow(clippy::unwrap_used)]
 
 use super::{
-    STATUS_DOT_UNKNOWN, STATUS_WIDTH, agent_name,
-    agents::{agent_labels, agent_place, status_style},
-    layout_tests,
-    render::header,
-    row::first_text,
-    workspace_label,
-    workspaces::workspace_entries,
+    STATUS_DOT_UNKNOWN, STATUS_WIDTH, agent_name, agents::status_style, layout_tests,
+    render::header, row::first_text, workspace_label, workspaces::workspace_entries,
 };
 use crate::config::{FontConfig, Theme};
-use herdr_client::protocol::{
-    AgentStatus, ClientShellAgent, ClientShellSnapshot, ClientShellWorkspace,
-};
+use herdr_client::protocol::{AgentStatus, ClientShellAgent, ClientShellWorkspace};
 
 #[test]
 fn section_headings_use_the_configured_sidebar_font_size() {
@@ -131,45 +124,9 @@ fn text_fallback_skips_missing_and_blank_metadata() {
 }
 
 #[test]
-fn agent_rows_name_their_place_then_their_agent() {
+fn agent_name_falls_back_through_the_documented_order() {
     let mut snapshot = layout_tests::snapshot(1);
-    let agent = &mut snapshot.agents[0];
-    agent.workspace_id = "w0".into();
-    agent.tab_id = "t0".into();
-    agent.display_agent = Some("Claude Code".into());
-    agent.name = Some("review".into());
-    agent.agent = Some("claude".into());
-    agent.title = Some("Fix sidebar".into());
     let agent = snapshot.agents[0].clone();
-    // Host first when there is one, then the workspace, then the tab. Only
-    // the workspace is primary; upstream mutes what sits around it.
-    fn labels<'a>(
-        snapshot: &'a ClientShellSnapshot,
-        host: Option<&'a str>,
-    ) -> (Vec<(&'a str, bool)>, &'a str) {
-        let agent = &snapshot.agents[0];
-        agent_labels(agent_name(agent), agent_place(agent, snapshot), host)
-    }
-    assert_eq!(
-        labels(&snapshot, None),
-        (vec![("herdr", true), ("tab 1", false)], "Claude Code")
-    );
-    assert_eq!(
-        labels(&snapshot, Some("remote")),
-        (
-            vec![("remote", false), ("herdr", true), ("tab 1", false)],
-            "Claude Code"
-        )
-    );
-    // One unnamed tab is noise, so only its workspace shows.
-    snapshot.tabs.retain(|tab| tab.tab_id == "t0");
-    assert_eq!(labels(&snapshot, None).0, vec![("herdr", true)]);
-    snapshot.tabs[0].custom_label = true;
-    assert_eq!(
-        labels(&snapshot, None).0,
-        vec![("herdr", true), ("tab 1", false)]
-    );
-    // The agent name falls back through the same order as upstream.
     for (display, name, kind, title, expected) in [
         (None, Some("review"), Some("claude"), None, "review"),
         (None, None, Some("claude"), Some("Fix sidebar"), "claude"),
@@ -183,11 +140,8 @@ fn agent_rows_name_their_place_then_their_agent() {
             title: title.map(str::to_owned),
             ..agent.clone()
         };
-        assert_eq!(labels(&snapshot, None).1, expected);
+        assert_eq!(agent_name(&snapshot.agents[0]), expected);
     }
-    // Without its workspace the agent names the row itself.
-    snapshot.workspaces.clear();
-    assert_eq!(labels(&snapshot, None), (vec![("agent", true)], ""));
 }
 
 #[test]
@@ -335,12 +289,14 @@ fn cells_hand_their_state_and_data_to_the_layout() {
 
     let snapshot = layout_tests::snapshot(1);
     let (font, theme) = (crate::config::Config::default().sidebar, Theme::default());
+    let agent_rows = super::AgentRows::default();
     let cx = RowContext {
         font: &font,
         theme: &theme,
         look: for_mode(Default::default()),
         width: 232.,
         host: None,
+        agent_rows: &agent_rows,
     };
     let recorder = Recorder::default();
     let workspace = || {
@@ -365,6 +321,8 @@ fn cells_hand_their_state_and_data_to_the_layout() {
             icon: crate::icons::AgentIcon::Generic,
             status: AgentStatus::Working,
             place: None,
+            source: &snapshot.agents[0],
+            pane_label: None,
         }),
         &cx,
     )

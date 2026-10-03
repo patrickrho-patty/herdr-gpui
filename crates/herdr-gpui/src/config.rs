@@ -6,6 +6,7 @@ use crate::{
     Error, Result,
     error::ThemeParseError,
     keymap::{Binding, Keymap},
+    sidebar::AgentRows,
 };
 pub(crate) mod watch;
 use gpui::{Font, FontFallbacks};
@@ -94,6 +95,7 @@ pub struct Config {
     pub features: Features,
     pub notifications: NotificationConfig,
     pub clipboard_toast: ClipboardToast,
+    pub(crate) agent_rows: AgentRows,
     pub layout: Layout,
     pub keybindings: Keymap,
 }
@@ -585,6 +587,7 @@ impl Default for Config {
             features: Features::default(),
             notifications: NotificationConfig::default(),
             clipboard_toast: ClipboardToast::default(),
+            agent_rows: AgentRows::default(),
             layout: Layout::default(),
             keybindings: Keymap::default(),
             sidebar: font(monospace, 12.0),
@@ -705,35 +708,41 @@ pub(crate) fn daemon_config_path(get: impl Fn(&str) -> Option<std::ffi::OsString
 /// A config file the GUI does not own can hold anything, including settings
 /// from a newer herdr, so only the keys read here matter and anything
 /// unreadable, oversized, malformed, or unrecognized leaves the defaults alone.
-fn daemon_clipboard_toast(path: &Path) -> ClipboardToast {
-    let mut resolved = ClipboardToast::default();
+#[derive(Clone, Default)]
+struct DaemonSettings {
+    clipboard: ClipboardToast,
+    agent_rows: AgentRows,
+}
+
+fn daemon_settings(path: &Path) -> DaemonSettings {
+    let mut resolved = DaemonSettings::default();
     if fs::metadata(path).is_ok_and(|data| data.len() > MAX_DAEMON_CONFIG_BYTES) {
         return resolved;
     }
-    let Some(clipboard) = fs::read_to_string(path)
+    let Some(table) = fs::read_to_string(path)
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|table| {
-            table
-                .get("ui")?
-                .get("toast")?
-                .get("clipboard")?
-                .as_table()
-                .cloned()
-        })
     else {
         return resolved;
     };
-    if let Some(enabled) = clipboard.get("enabled").and_then(toml::Value::as_bool) {
-        resolved.enabled = enabled;
-    }
-    if let Some(position) = clipboard
-        .get("position")
-        .cloned()
-        .and_then(|position| position.try_into().ok())
+    if let Some(clipboard) = table
+        .get("ui")
+        .and_then(|ui| ui.get("toast"))
+        .and_then(|toast| toast.get("clipboard"))
+        .and_then(toml::Value::as_table)
     {
-        resolved.position = position;
+        if let Some(enabled) = clipboard.get("enabled").and_then(toml::Value::as_bool) {
+            resolved.clipboard.enabled = enabled;
+        }
+        if let Some(position) = clipboard
+            .get("position")
+            .cloned()
+            .and_then(|position| position.try_into().ok())
+        {
+            resolved.clipboard.position = position;
+        }
     }
+    resolved.agent_rows = AgentRows::from_daemon(&table);
     resolved
 }
 
@@ -816,20 +825,20 @@ impl Config {
             },
             Err(error) => return Err(Error::from(error).at_path(&local)),
         };
-        Self::parse_layers([DEFAULT_CONFIG, &text], daemon_clipboard_toast(daemon))
+        Self::parse_layers([DEFAULT_CONFIG, &text], daemon_settings(daemon))
             .map_err(|error| error.at_path(&source))
     }
 
     /// `daemon` is the herdr config whose settings this GUI also honors. It is
     /// read for those keys alone and never written; a missing one is normal.
     fn load_path(path: &Path, daemon: &Path) -> Result<Self> {
-        let base = daemon_clipboard_toast(daemon);
+        let base = daemon_settings(daemon);
         let (_lock, local) = Self::prepare_files(path)?;
         let text =
             fs::read_to_string(&local).map_err(|error| Error::from(error).at_path(&local))?;
         // Validate the override independently so bad types/unknown keys cannot
         // disappear inside the merge. Empty arrays explicitly replace defaults.
-        Self::parse_over(&text, base).map_err(|error| error.at_path(&local))?;
+        Self::parse_over(&text, base.clone()).map_err(|error| error.at_path(&local))?;
         Self::parse_layers([DEFAULT_CONFIG, &text], base).map_err(|error| error.at_path(&local))
     }
 
@@ -863,7 +872,7 @@ impl Config {
         if let Some(text) = legacy {
             // Never replace an old user's file until its exact contents are
             // safely stored in the local file. A conflict needs human resolution.
-            Self::parse_over(text, ClipboardToast::default())
+            Self::parse_over(text, DaemonSettings::default())
                 .map_err(|error| error.at_path(path))?;
         }
         match fs::read_to_string(&local) {
@@ -912,18 +921,18 @@ impl Config {
     /// tests below read, since loading also consults the daemon's config.
     #[cfg(test)]
     fn parse(text: &str) -> Result<Self> {
-        Self::parse_over(text, ClipboardToast::default())
+        Self::parse_over(text, DaemonSettings::default())
     }
 
     /// `base` is what the daemon's own config asked for, which every key this
     /// file names overrides.
-    fn parse_over(text: &str, base: ClipboardToast) -> Result<Self> {
+    fn parse_over(text: &str, base: DaemonSettings) -> Result<Self> {
         Self::parse_layers([text], base)
     }
 
     fn parse_layers<'a>(
         texts: impl IntoIterator<Item = &'a str>,
-        base: ClipboardToast,
+        base: DaemonSettings,
     ) -> Result<Self> {
         let mut builder = config_loader::Config::builder();
         for text in texts {
@@ -942,7 +951,8 @@ impl Config {
         config.github = settings.github;
         config.features = settings.features;
         config.notifications = settings.notifications;
-        config.clipboard_toast = settings.clipboard_toast.resolve(base);
+        config.clipboard_toast = settings.clipboard_toast.resolve(base.clipboard);
+        config.agent_rows = base.agent_rows;
         if !settings.layout.sidebar_gap.is_finite()
             || !(0.0..=MAX_SIDEBAR_GAP).contains(&settings.layout.sidebar_gap)
         {
@@ -1974,7 +1984,7 @@ mod tests {
             assert_eq!(
                 face.size(&Config::parse_layers(
                     [DEFAULT_CONFIG, &known],
-                    ClipboardToast::default()
+                    DaemonSettings::default()
                 )?),
                 size
             );
@@ -2239,7 +2249,7 @@ mod tests {
         assert!(text.contains("layout = \"orca\""), "{text}");
         assert!(text.contains("# New installs start"), "{text}");
         let merged =
-            Config::parse_layers([DEFAULT_CONFIG, text.as_str()], ClipboardToast::default())?;
+            Config::parse_layers([DEFAULT_CONFIG, text.as_str()], DaemonSettings::default())?;
         assert_eq!(merged.layout.mode, LayoutMode::Orca);
         // A table gets its mode beside the gap, and keeps its comments.
         fs::write(
@@ -2414,7 +2424,7 @@ mod tests {
         // The managed defaults document the table without setting it.
         let layered = Config::parse_layers(
             [DEFAULT_CONFIG, "[keybindings]\nthemes = \"cmd-k\""],
-            ClipboardToast::default(),
+            DaemonSettings::default(),
         )?;
         assert_eq!(layered.keybindings.primary(Command::Themes), "cmd-k");
         assert_eq!(layered.keybindings.primary(Command::Tab), "cmd-t");
@@ -2749,7 +2759,7 @@ mod tests {
                 "[terminal]\nfallback = ['first', 'second']",
                 "[terminal]\nfallback = []",
             ],
-            ClipboardToast::default(),
+            DaemonSettings::default(),
         )?;
         assert_eq!(merged.terminal.fallbacks, Some(vec![]));
         Ok(())

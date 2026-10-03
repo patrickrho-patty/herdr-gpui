@@ -6,10 +6,11 @@
 use super::layout_tests;
 use super::{
     ARROW_RESERVE, ICON_RESERVE, STATUS_WIDTH,
-    cell::RowState,
+    agent_rows::{Color, Piece, Rule, Token},
+    cell::{AgentRow, RowContext, RowState},
     glyph_width,
     layout::{SidebarDensity, SidebarLook},
-    line_height, segment_budgets, status_indicator,
+    line_height, segment_budgets, status_indicator, status_style,
 };
 use crate::config::{FontConfig, Theme};
 use gpui::{prelude::*, *};
@@ -581,7 +582,6 @@ fn agent_mark(
 pub(crate) fn label_text(text: &str) -> SharedString {
     text.to_owned().into()
 }
-
 #[cfg(any(test, feature = "integration-test"))]
 pub(crate) fn label_text(text: &str) -> layout_tests::ProbeText {
     layout_tests::ProbeText(text.to_owned().into())
@@ -597,4 +597,197 @@ pub(super) fn first_text<'a>(
         .map(str::trim)
         .find(|s| !s.is_empty())
         .unwrap_or(fallback)
+}
+
+/// Paints an agent row from the daemon's token rules, as the classic layout
+/// does: one line per configured row, the status dot and identity icon inline,
+/// `name-` on the first line and `detail-` on the agent's own.
+pub(super) fn agent_rules(
+    key: &str,
+    rule_rows: &[Vec<Rule>],
+    agent: &AgentRow<'_>,
+    state: RowState,
+    cx: &RowContext<'_>,
+) -> Div {
+    let (font, theme, look) = (cx.font, cx.theme, cx.look);
+    let line = line_height(font);
+    let gap = cx.agent_rows.gap as f32 * line;
+    let width = look.content_width(cx.width).max(0.);
+    // A line no token has anything to say on collapses, so an orphaned agent
+    // keeps its name on the first line instead of an empty one above it.
+    let resolved: Vec<Vec<(&Rule, Piece<'_>)>> = rule_rows
+        .iter()
+        .map(|rules| {
+            rules
+                .iter()
+                .filter_map(|rule| {
+                    rule.resolve(
+                        agent.source,
+                        agent.name,
+                        agent.place,
+                        cx.host,
+                        agent.pane_label,
+                    )
+                    .map(|piece| (rule, piece))
+                })
+                .collect()
+        })
+        .filter(|line: &Vec<(&Rule, Piece<'_>)>| {
+            line.iter()
+                .any(|(_, piece)| matches!(piece, Piece::Text { .. }))
+        })
+        .collect();
+    let rows = resolved.len().max(1);
+    let agent_line = resolved
+        .iter()
+        .position(|rules| rules.iter().any(|(rule, _)| rule.token == Token::Agent));
+    let agent_size = line.min(12.);
+    let agent_reserve = agent_size + 4.;
+    let mut column = div()
+        .debug_selector(|| format!("column-{key}"))
+        .flex()
+        .flex_col()
+        .w(px(width))
+        .min_w_0();
+    for (index, rules) in resolved.iter().enumerate() {
+        let selector = match index {
+            0 => format!("name-{key}"),
+            1 => format!("detail-{key}"),
+            _ => format!("line-{index}-{key}"),
+        };
+        let icon = (agent_line == Some(index)).then_some(agent.icon);
+        let mut spans = div()
+            .debug_selector(move || selector)
+            .flex()
+            .items_center()
+            .gap(px(4.))
+            .min_w_0()
+            .flex_1();
+        if icon.is_some() {
+            spans = spans.ml(px(agent_reserve));
+        }
+        let mut first = true;
+        for (rule, piece) in rules {
+            if !first {
+                spans = spans.child(
+                    div()
+                        .flex_none()
+                        .text_color(rgb(theme.muted))
+                        .child(label_text("\u{b7}")),
+                );
+            }
+            first = false;
+            let mut color = rule.fg.map_or_else(
+                || contextual_color(rule, agent, theme, state.selected),
+                |fg| named_color(fg, theme),
+            );
+            if rule.dim.unwrap_or(false) {
+                color = blend(color, theme.background, 50);
+            }
+            let bold = rule
+                .bold
+                .unwrap_or(matches!(rule.token, Token::Workspace | Token::Agent));
+            spans = match piece {
+                Piece::Icon => spans.child(status_dot(agent.status)),
+                Piece::Text { text } => spans.child(
+                    div()
+                        .truncate()
+                        .min_w_0()
+                        .text_color(rgb(color))
+                        .font_weight(if bold {
+                            FontWeight::BOLD
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .child(label_text(text)),
+                ),
+            };
+        }
+        column = column.child(
+            div()
+                .relative()
+                .w_full()
+                .h(px(line))
+                .flex()
+                .items_center()
+                .when_some(icon, |line, icon| {
+                    line.child(agent_mark(key, icon, agent_size, theme.muted, font))
+                })
+                .child(spans),
+        );
+    }
+    div()
+        .debug_selector(|| format!("row-{key}"))
+        .h(px(look.row_height(line * rows as f32) + gap))
+        .w_full()
+        .min_w_0()
+        .flex_none()
+        .relative()
+        .pl(px(look.content_x()))
+        .pr(px(look.content_x()))
+        .flex()
+        .items_start()
+        .py(px(look.row_padding() + look.spacing() / 2.))
+        .cursor_pointer()
+        .child(column)
+        .map(|row| look.mark(row, key, state, theme))
+}
+
+/// The status dot `state_icon` paints, sized and colored from the theme's own
+/// status palette.
+fn status_dot(status: AgentStatus) -> Div {
+    let (diameter, filled, color) = status_style(status);
+    div()
+        .size(px(STATUS_WIDTH))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .size(px(diameter))
+                .rounded_full()
+                .border_1()
+                .border_color(rgb(color))
+                .when(filled, |dot| dot.bg(rgb(color))),
+        )
+}
+
+fn contextual_color(rule: &Rule, agent: &AgentRow<'_>, theme: &Theme, selected: bool) -> u32 {
+    match rule.token {
+        Token::StateIcon | Token::StateText => status_style(agent.status).2,
+        Token::Machine | Token::Tab | Token::Pane | Token::Custom(_) => theme.muted,
+        Token::Workspace => theme.subtext(),
+        Token::Agent => {
+            if selected {
+                theme.foreground
+            } else {
+                theme.subtext()
+            }
+        }
+        Token::TerminalTitle | Token::TerminalTitleStripped => theme.subtext(),
+    }
+}
+
+fn named_color(color: Color, theme: &Theme) -> u32 {
+    match color {
+        Color::Accent => theme.primary(),
+        Color::Black => theme.palette[0],
+        Color::Red => theme.palette[1],
+        Color::Green => theme.palette[2],
+        Color::Yellow => theme.palette[3],
+        Color::Blue => theme.palette[4],
+        Color::Magenta => theme.palette[5],
+        Color::Cyan => theme.palette[6],
+        Color::White => theme.palette[7],
+        Color::Hex(value) => value,
+    }
+}
+
+fn blend(base: u32, over: u32, percent: u32) -> u32 {
+    let channel = |shift: u32| {
+        let (base, over) = ((base >> shift) & 0xff, (over >> shift) & 0xff);
+        (over * percent + base * (100 - percent)) / 100
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }

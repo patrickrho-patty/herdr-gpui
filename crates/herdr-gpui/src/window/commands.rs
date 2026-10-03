@@ -9,7 +9,9 @@ use crate::{
     controls::{self, Command},
     log_window,
     navigation::{NavigationTarget, OwnedNavigationTarget},
-    open_additional_window, state,
+    open_additional_window,
+    sidebar::{sorted_agents, stepped_index},
+    state,
 };
 use gpui::{Context, Window};
 use std::time::Duration;
@@ -80,6 +82,45 @@ impl HerdrWindow {
         self.marked.clear();
         cx.notify();
         queued
+    }
+
+    /// Focuses the next agent row the sidebar paints, walking across hosts in
+    /// the panel's own order: hidden hosts skipped, each host's agents in the
+    /// selected sort. With no agent focused, forward starts at the top and
+    /// backward at the bottom.
+    pub(crate) fn focus_adjacent_agent(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let mut current = None;
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            if !self.device_visible(&endpoint.id) {
+                continue;
+            }
+            let live = if index == self.selected_endpoint {
+                &self.live
+            } else {
+                &endpoint.live
+            };
+            let Some(snapshot) = &live.snapshot else {
+                continue;
+            };
+            for agent in sorted_agents(&snapshot.agents, self.agent_sort) {
+                if index == self.selected_endpoint && agent.focused {
+                    current = Some(rows.len());
+                }
+                rows.push((endpoint.id.clone(), agent.pane_id.clone()));
+            }
+        }
+        let Some(step) = stepped_index(current, rows.len(), forward) else {
+            return;
+        };
+        let (endpoint, pane) = rows.swap_remove(step);
+        self.navigate_endpoint(&endpoint, NavigationTarget::Pane(&pane), cx);
+        window.focus(&self.focus, cx);
     }
 
     /// `label` is what a failure is reported as, not a method name: navigation
@@ -271,6 +312,10 @@ impl HerdrWindow {
             }
             Command::About => {
                 self.open_about(window, cx);
+                return;
+            }
+            Command::NextAgent | Command::PreviousAgent => {
+                self.focus_adjacent_agent(command == Command::NextAgent, window, cx);
                 return;
             }
             Command::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
